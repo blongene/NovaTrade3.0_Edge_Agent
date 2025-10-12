@@ -1,0 +1,12 @@
+# PowerShell
+Get-Content .env | ForEach-Object {
+  if ($_ -match '^\s*#') { return }
+  if ($_ -match '^\s*$') { return }
+  $k,$v = $_ -split '=',2
+  [Environment]::SetEnvironmentVariable($k,$v,'Process')
+}
+python edge_agent.py
+
+#as background process:
+#Start-Process -FilePath python -ArgumentList 'edge_agent.py' -WindowStyle Hidden
+# to stop later: kill the python process or use Task Manager

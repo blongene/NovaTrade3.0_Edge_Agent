@@ -1,0 +1,19 @@
+# Dockerfile.edge — NovaTrade Edge Agent
+FROM python:3.11-slim
+
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+
+# System deps if needed (uncomment if you need them)
+# RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/
+RUN pip install -r requirements.txt
+
+COPY . /app/
+
+# Default envs can be overridden in Render
+ENV EDGE_MODE=dryrun EDGE_HOLD=false EDGE_POLL_SECS=10
+
+# Start the agent
+CMD ["python", "edge_agent.py"]

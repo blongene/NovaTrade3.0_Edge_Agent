@@ -1,0 +1,29 @@
+$env:CLOUD_BASE_URL = "https://novatrade3-0.onrender.com"
+$env:AGENT_ID       = "edge-cb-1"        # for the Coinbase agent in this window
+$env:EDGE_SECRET    = "3f36e385d5b3c83e66209cdac0d815788e1459b49cc67b6a6159cfa4de34511b8"
+$env:EDGE_MODE      = "dryrun"
+$env:EDGE_HOLD      = "false"
+$env:EDGE_POLL_SECS = "10"
+
+python edge_agent.py
+
+
+$env:CLOUD_BASE_URL = "https://novatrade3-0.onrender.com"
+$env:AGENT_ID       = "edge-bus-1"
+$env:EDGE_SECRET    = "3f36e385d5b3c83e66209cdac0d815788e1459b49cc67b6a6159cfa4de34511b8"
+$env:EDGE_MODE      = "dryrun"
+$env:EDGE_HOLD      = "false"
+$env:EDGE_POLL_SECS = "10"
+
+python edge_agent.py
+
+python ops_sign_and_enqueue.py --base https://novatrade3-0.onrender.com --secret 3f36e385d5b3c83e66209cdac0d815788e1459b49cc67b6a6159cfa4de34511b8 --agent edge-cb-1 --venue COINBASE --symbol BTC/USDT --side BUY --amount 25
+
+python ops_sign_and_enqueue.py --base https://novatrade3-0.onrender.com --secret 3f36e385d5b3c83e66209cdac0d815788e1459b49cc67b6a6159cfa4de34511b8 --agent edge-bus-1 --venue BINANCE.US --symbol BTC/USDT --side BUY --amount 25
+
+https://novatrade3-0.onrender.com/ops/debug/dbinfo
+https://novatrade3-0.onrender.com/ops/debug/cmds
+https://novatrade3-0.onrender.com/ops/debug/cmds?agent=edge-cb-1
+https://novatrade3-0.onrender.com/ops/debug/cmds?agent=edge-bus-1
+https://novatrade3-0.onrender.com/ops/debug/receipts
+

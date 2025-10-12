@@ -1,0 +1,89 @@
+name: Build & Release Pack
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set version and date
+        id: meta
+        run: |
+          echo "DATE=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          echo "TAG=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          # Derive a friendly pack name from the tag (v3 -> v3)
+          echo "PACK=NovaTrade_Pack_${{ steps.meta.outputs.DATE }}_${{ steps.meta.outputs.TAG }}.zip" >> $GITHUB_OUTPUT
+
+      - name: Create build artifact zip
+        run: |
+          mkdir -p build
+          zip -r "build/${{ steps.meta.outputs.PACK }}" . \
+            -x ".git/*" ".github/*" "**/__pycache__/*" ".venv/*" "env/*" "logs/*" "*.log" ".DS_Store"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.TAG }}
+          name: "NovaTrade ${{
+            steps.meta.outputs.TAG
+          }} — ${{ steps.meta.outputs.DATE }}"
+          draft: false
+          prerelease: false
+          files: build/${{ steps.meta.outputs.PACK }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # OPTIONAL: copy to Drive/OneDrive with rclone
+  drive:
+    if: ${{ always() }}
+    needs: pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore build from previous job
+        uses: actions/download-artifact@v4
+        with:
+          name: artifact  # not used (zip uploaded directly), step kept for future use
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone remote
+        run: |
+          mkdir -p ~/.config/rclone
+          printf "%s" "${RCLONE_CONFIG}" > ~/.config/rclone/rclone.conf
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Determine latest release asset
+        id: release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const release = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: process.env.GITHUB_REF_NAME
+            })
+            const asset = release.data.assets[0]
+            core.setOutput('asset_url', asset.browser_download_url)
+            core.setOutput('asset_name', asset.name)
+      - name: Download asset
+        run: |
+          curl -L "${{ steps.release.outputs.asset_url }}" -o "${{ steps.release.outputs.asset_name }}"
+
+      - name: Copy to cloud
+        run: |
+          # Choose ONE destination by setting secret DEST_PATH
+          # Examples:
+          #   onedrive:NovaTrade/Builds
+          #   gdrive:NovaTrade/Builds
+          rclone copy "${{ steps.release.outputs.asset_name }}" "${{ secrets.DEST_PATH }}" --progress

@@ -1,0 +1,12 @@
+allowed_venues: ["MEXC", "KRAKEN", "COINBASE_ADV"]
+allowed_products: ["BTC/USDT", "ETH/USDT"]
+max_quote_per_order_usd: 50
+round_volume_dp: 8
+
+max_usd_per_trade: 25
+max_usd_per_day: 200
+slippage_limit_pct: 0.8
+max_drawdown_daily_pct: 6
+kill_switches:
+  cloud_hold_flag: true     # respects NovaTrigger=HOLD if you’ve wired it
+  edge_hold_env: false
