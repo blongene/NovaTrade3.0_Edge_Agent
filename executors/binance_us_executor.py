@@ -41,8 +41,10 @@ class BinanceUS:
         except Exception: data = {"raw": r.text}
         return r, data
 
-def execute_market_order(*, venue_symbol:str, side:str, amount_quote:float, amount_base:float,
-                         client_id:str, edge_mode:str, edge_hold:bool):
+def execute_market_order(*, venue_symbol: str, side: str,
+                         amount_quote: float = 0.0, amount_base: float = 0.0,
+                         client_id: str = "", edge_mode: str = "dryrun",
+                         edge_hold: bool = False, **_):
     symbol = venue_symbol.replace("-","").replace("/","").upper()
     if edge_hold:
         return {"status":"held","message":"EDGE_HOLD enabled","fills":[],"venue":"BINANCEUS","symbol":symbol,"side":side}
