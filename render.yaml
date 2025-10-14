@@ -6,26 +6,41 @@ services:
     name: novatrade-bus
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: bash start.sh         # or python -u worker.py & gunicorn ...
+    startCommand: bash start.sh
     envVars:
-      PORT: 10000
-      OUTBOX_DB_PATH: /data/outbox.db
-      OUTBOX_SECRET: ${OUTBOX_SECRET}           # shared secret
-      EDGE_SECRET: ${OUTBOX_SECRET}
-      OUTBOX_AGENT_ALLOW: edge-cb-1
-      REQUIRE_HMAC_PULL: 1
-      REQUIRE_HMAC_OPS: 1
-      OUTBOX_LEASE_S: 120
-      RUN_BOOT_IN_WSGI: 1
-      RUN_WEBHOOK_IN_MAIN: 0
-      SHEET_URL: ${SHEET_URL}
-      GOOGLE_CREDS_JSON_PATH: sentiment-log-service.json
+      - key: OUTBOX_DB_PATH
+        value: /data/outbox.db
+      - key: OUTBOX_SECRET
+        value: ${OUTBOX_SECRET}      # set in Blueprint vars or later in the Dashboard
+      - key: EDGE_SECRET
+        value: ${OUTBOX_SECRET}
+      - key: OUTBOX_AGENT_ALLOW
+        value: edge-cb-1
+      - key: REQUIRE_HMAC_PULL
+        value: "1"
+      - key: REQUIRE_HMAC_OPS
+        value: "1"
+      - key: OUTBOX_LEASE_S
+        value: "120"
+      - key: RUN_BOOT_IN_WSGI
+        value: "1"
+      - key: RUN_WEBHOOK_IN_MAIN
+        value: "0"
+      - key: SHEET_URL
+        value: ${SHEET_URL}
+      - key: GOOGLE_CREDS_JSON_PATH
+        value: sentiment-log-service.json
     plan: starter
     autoDeploy: true
     disk:
       name: outbox-data
       mountPath: /data
       sizeGB: 1
+    # (optional) deliver the Google service-account JSON as a secret file:
+    files:
+      - name: sentiment-log-service.json
+        contents: ${GOOGLE_CREDS_JSON_B64}   # base64 of the JSON (see notes below)
+        encoding: base64
 
   # --- Edge Agent (background worker) --------------------------------------
   - type: worker
@@ -33,17 +48,29 @@ services:
     env: docker
     dockerfilePath: Dockerfile.edge
     envVars:
-      CLOUD_BASE_URL: https://novatrade-bus.onrender.com
-      AGENT_ID: edge-cb-1
-      EDGE_SECRET: ${OUTBOX_SECRET}
-      EDGE_MODE: dryrun
-      EDGE_HOLD: false
-      EDGE_POLL_SECS: 10
+      - key: CLOUD_BASE_URL
+        value: https://novatrade-bus.onrender.com
+      - key: AGENT_ID
+        value: edge-cb-1
+      - key: EDGE_SECRET
+        value: ${OUTBOX_SECRET}
+      - key: EDGE_MODE
+        value: dryrun
+      - key: EDGE_HOLD
+        value: "false"
+      - key: EDGE_POLL_SECS
+        value: "10"
       # Exchange creds (fill as needed)
-      COINBASE_API_KEY: ${COINBASE_API_KEY}
-      COINBASE_API_SECRET: ${COINBASE_API_SECRET}
-      BINANCEUS_API_KEY: ${BINANCEUS_API_KEY}
-      BINANCEUS_API_SECRET: ${BINANCEUS_API_SECRET}
-      KRAKEN_KEY: ${KRAKEN_KEY}
-      KRAKEN_SECRET: ${KRAKEN_SECRET}
+      - key: COINBASE_API_KEY
+        value: ${COINBASE_API_KEY}
+      - key: COINBASE_API_SECRET
+        value: ${COINBASE_API_SECRET}   # base64 secret from Coinbase Advanced
+      - key: BINANCEUS_API_KEY
+        value: ${BINANCEUS_API_KEY}
+      - key: BINANCEUS_API_SECRET
+        value: ${BINANCEUS_API_SECRET}
+      - key: KRAKEN_KEY
+        value: ${KRAKEN_KEY}
+      - key: KRAKEN_SECRET
+        value: ${KRAKEN_SECRET}         # base64 secret
     plan: starter
