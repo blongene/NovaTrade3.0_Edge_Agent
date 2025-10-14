@@ -1,7 +1,4 @@
-# render.yaml — NovaTrade 3.x unified deploy (bus + edge)
-
 services:
-  # --- Cloud orchestrator (the "bus") ---------------------------------------
   - type: web
     name: novatrade-bus
     env: python
@@ -11,7 +8,7 @@ services:
       - key: OUTBOX_DB_PATH
         value: /data/outbox.db
       - key: OUTBOX_SECRET
-        value: ${OUTBOX_SECRET}      # set in Blueprint vars or later in the Dashboard
+        value: ${OUTBOX_SECRET}
       - key: EDGE_SECRET
         value: ${OUTBOX_SECRET}
       - key: OUTBOX_AGENT_ALLOW
@@ -30,19 +27,16 @@ services:
         value: ${SHEET_URL}
       - key: GOOGLE_CREDS_JSON_PATH
         value: sentiment-log-service.json
+      # Optional if you choose Option B (decode in start.sh)
+      # - key: GOOGLE_CREDS_JSON_B64
+      #   value: ${GOOGLE_CREDS_JSON_B64}
     plan: starter
     autoDeploy: true
     disk:
       name: outbox-data
       mountPath: /data
       sizeGB: 1
-    # (optional) deliver the Google service-account JSON as a secret file:
-    files:
-      - name: sentiment-log-service.json
-        contents: ${GOOGLE_CREDS_JSON_B64}   # base64 of the JSON (see notes below)
-        encoding: base64
 
-  # --- Edge Agent (background worker) --------------------------------------
   - type: worker
     name: novatrade-edge
     env: docker
@@ -60,11 +54,10 @@ services:
         value: "false"
       - key: EDGE_POLL_SECS
         value: "10"
-      # Exchange creds (fill as needed)
       - key: COINBASE_API_KEY
         value: ${COINBASE_API_KEY}
       - key: COINBASE_API_SECRET
-        value: ${COINBASE_API_SECRET}   # base64 secret from Coinbase Advanced
+        value: ${COINBASE_API_SECRET}
       - key: BINANCEUS_API_KEY
         value: ${BINANCEUS_API_KEY}
       - key: BINANCEUS_API_SECRET
@@ -72,5 +65,5 @@ services:
       - key: KRAKEN_KEY
         value: ${KRAKEN_KEY}
       - key: KRAKEN_SECRET
-        value: ${KRAKEN_SECRET}         # base64 secret
+        value: ${KRAKEN_SECRET}
     plan: starter
