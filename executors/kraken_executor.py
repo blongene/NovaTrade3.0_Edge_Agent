@@ -111,8 +111,10 @@ def execute(cmd: dict) -> dict:
     return {"ok": True, "venue":"KRAKEN","pair":pair,"txid":txid,"price":f"{price:.8f}","qty":f"{qty:.8f}","raw":res}
 
 # --- Adapter so Edge can call with the same shape as other executors ---------
-def execute_market_order(*, venue_symbol:str, side:str, amount_quote:float, amount_base:float,
-                         client_id:str, edge_mode:str, edge_hold:bool):
+def execute_market_order(*, venue_symbol: str, side: str,
+                         amount_quote: float = 0.0, amount_base: float = 0.0,
+                         client_id: str = "", edge_mode: str = "dryrun",
+                         edge_hold: bool = False, **_):
     pair = _sym(venue_symbol)
     if edge_hold:
         return {"status":"held","message":"EDGE_HOLD enabled","fills":[],"venue":"KRAKEN","symbol":pair,"side":side}
