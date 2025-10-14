@@ -52,9 +52,13 @@ class CoinbaseAdv:
         }
         return self._post_retry(ORDERS_PATH, body)
 
-def execute_market_order(*, venue_symbol: str, side: str, amount_quote: float, client_id: str,
-                         edge_mode: str, edge_hold: bool):
+def execute_market_order(*, venue_symbol: str, side: str,
+                         amount_quote: float = 0.0, amount_base: float = 0.0,
+                         client_id: str = "", edge_mode: str = "dryrun", edge_hold: bool = False, **_):
     symbol = venue_symbol.replace("/", "-").upper()  # BTC/USDC → BTC-USDC
+    if edge_mode == "live" and side.upper() == "SELL" and not amount_base:
+        return {"status":"error","message":"Coinbase MARKET SELL requires base amount (amount_base)","fills":[],
+                "venue":"COINBASE","symbol":symbol,"side":side}
     if edge_hold:
         return {"status":"held","message":"EDGE_HOLD enabled","fills":[],"venue":"COINBASE","symbol":symbol,"side":side}
     if edge_mode != "live":
