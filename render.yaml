@@ -1,0 +1,49 @@
+# render.yaml — NovaTrade 3.x unified deploy (bus + edge)
+
+services:
+  # --- Cloud orchestrator (the "bus") ---------------------------------------
+  - type: web
+    name: novatrade-bus
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash start.sh         # or python -u worker.py & gunicorn ...
+    envVars:
+      PORT: 10000
+      OUTBOX_DB_PATH: /data/outbox.db
+      OUTBOX_SECRET: ${OUTBOX_SECRET}           # shared secret
+      EDGE_SECRET: ${OUTBOX_SECRET}
+      OUTBOX_AGENT_ALLOW: edge-cb-1
+      REQUIRE_HMAC_PULL: 1
+      REQUIRE_HMAC_OPS: 1
+      OUTBOX_LEASE_S: 120
+      RUN_BOOT_IN_WSGI: 1
+      RUN_WEBHOOK_IN_MAIN: 0
+      SHEET_URL: ${SHEET_URL}
+      GOOGLE_CREDS_JSON_PATH: sentiment-log-service.json
+    plan: starter
+    autoDeploy: true
+    disk:
+      name: outbox-data
+      mountPath: /data
+      sizeGB: 1
+
+  # --- Edge Agent (background worker) --------------------------------------
+  - type: worker
+    name: novatrade-edge
+    env: docker
+    dockerfilePath: Dockerfile.edge
+    envVars:
+      CLOUD_BASE_URL: https://novatrade-bus.onrender.com
+      AGENT_ID: edge-cb-1
+      EDGE_SECRET: ${OUTBOX_SECRET}
+      EDGE_MODE: dryrun
+      EDGE_HOLD: false
+      EDGE_POLL_SECS: 10
+      # Exchange creds (fill as needed)
+      COINBASE_API_KEY: ${COINBASE_API_KEY}
+      COINBASE_API_SECRET: ${COINBASE_API_SECRET}
+      BINANCEUS_API_KEY: ${BINANCEUS_API_KEY}
+      BINANCEUS_API_SECRET: ${BINANCEUS_API_SECRET}
+      KRAKEN_KEY: ${KRAKEN_KEY}
+      KRAKEN_SECRET: ${KRAKEN_SECRET}
+    plan: starter
