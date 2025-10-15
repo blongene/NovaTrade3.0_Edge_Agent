@@ -5,6 +5,13 @@ import os, time, json, hmac, hashlib, requests, sys, traceback, re
 from executors.coinbase_advanced_executor import execute_market_order as cb_exec
 from executors.binance_us_executor import execute_market_order as bus_exec
 from executors.kraken_executor import execute_market_order as kr_exec
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+retry = Retry(total=3, connect=3, read=3, backoff_factor=0.5,
+              status_forcelist=(502,503,504),
+              allowed_methods=frozenset(["GET","POST"]))
+SESSION.mount("https://", HTTPAdapter(max_retries=retry))
+SESSION.mount("http://",  HTTPAdapter(max_retries=retry))
 
 # --- Env ---------------------------------------------------------------------
 CLOUD_BASE_URL = os.getenv("CLOUD_BASE_URL") or os.getenv("BASE_URL") or "http://localhost:10000"
@@ -184,12 +191,9 @@ def post_receipt(cmd: dict, exec_result: dict):
     canon = _canon(payload)
     payload["hmac"] = _hmac_hex(EDGE_SECRET, canon)  # sign canonical payload (without 'hmac')
 
-    url = CLOUD_BASE_URL.rstrip("/") + "/api/receipts/ack"
-    try:
-        r = SESSION.post(url, json=payload, timeout=15)
-        _log(f"posted receipt {cmd['id']}: {r.status_code} {r.text[:120]}")
-    except Exception as e:
-        _log(f"receipt post failed for {cmd['id']}: {e}")
+   url = CLOUD_BASE_URL.rstrip("/") + "/api/receipts/ack"
+   r = _post_signed_retry(url, payload, timeout=30, retries=3)
+   _log(f"posted receipt {cmd['id']}: {r.status_code} {r.text[:120]}")
 
 # --- Optional heartbeat ------------------------------------------------------
 _last_hb = 0
