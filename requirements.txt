@@ -6,3 +6,4 @@ oauth2client
 plotly
 pandas
 flask
+coinbase-advanced-py>=1.6.0
