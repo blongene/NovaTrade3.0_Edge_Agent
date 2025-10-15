@@ -93,17 +93,19 @@ class CoinbaseCDP:
         For BUY: use quote_size (e.g., USDC amount).
         For SELL: use base_size  (e.g., BTC quantity).
         """
-        side_lc = (side or "").lower()
-        cfg: dict
-        if side_lc == "buy":
+        side_uc = (side or "").upper()
+        if side_uc not in {"BUY", "SELL"}:
+            raise ValueError(f"invalid side: {side}")
+
+        if side_uc == "BUY":
             cfg = {"market_market_ioc": {"quote_size": str(float(quote_size or 0.0))}}
         else:
             cfg = {"market_market_ioc": {"base_size":  str(float(base_size  or 0.0))}}
 
         body = {
             "client_order_id": str(client_order_id or f"NT-{int(time.time()*1000)}"),
-            "product_id": product_id,         # e.g., BTC-USDC
-            "side": side_lc,                  # "buy" | "sell"
+            "product_id": product_id,   # e.g., BTC-USDC
+            "side": side_uc,            # MUST be uppercase: BUY | SELL
             "order_configuration": cfg
         }
         return self._post_retry(ORDERS_PATH, body)
@@ -111,75 +113,49 @@ class CoinbaseCDP:
 def execute_market_order(*, venue_symbol: str, side: str,
                          amount_quote: float = 0.0, amount_base: float = 0.0,
                          client_id: str = "", edge_mode: str = "dryrun", edge_hold: bool = False, **_):
-    """
-    NovaTrade executor entrypoint (used by edge_agent).
-    Normalizes symbol, respects EDGE_MODE/EDGE_HOLD, and calls CDP-backed Advanced Trade.
-    """
-    symbol = venue_symbol.replace("/", "-").upper()  # e.g., BTC/USDC → BTC-USDC
+    symbol = venue_symbol.replace("/", "-").upper()  # BTC/USDC → BTC-USDC
+    side_uc = (side or "").upper()
 
     # SELL requires base qty; BUY requires quote amount
-    if edge_mode == "live" and side.upper() == "SELL" and not amount_base:
-        return {"status": "error",
-                "message": "Coinbase MARKET SELL requires base amount (amount_base)",
-                "fills": [], "venue": "COINBASE", "symbol": symbol, "side": side}
-
-    if edge_mode == "live" and side.upper() == "BUY" and not amount_quote:
-        return {"status": "error",
-                "message": "Coinbase MARKET BUY requires quote amount (amount_quote)",
-                "fills": [], "venue": "COINBASE", "symbol": symbol, "side": side}
+    if edge_mode == "live" and side_uc == "SELL" and not amount_base:
+        return {"status":"error","message":"Coinbase MARKET SELL requires base amount (amount_base)","fills":[],
+                "venue":"COINBASE","symbol":symbol,"side":side_uc}
+    if edge_mode == "live" and side_uc == "BUY" and not amount_quote:
+        return {"status":"error","message":"Coinbase MARKET BUY requires quote amount (amount_quote)","fills":[],
+                "venue":"COINBASE","symbol":symbol,"side":side_uc}
 
     if edge_hold:
-        return {"status": "held", "message": "EDGE_HOLD enabled", "fills": [],
-                "venue": "COINBASE", "symbol": symbol, "side": side}
+        return {"status":"held","message":"EDGE_HOLD enabled","fills":[],
+                "venue":"COINBASE","symbol":symbol,"side":side_uc}
 
-    # Dryrun
     if edge_mode != "live":
         px = 60000.0
-        qty = round(float(amount_base or (amount_quote or 0.0) / px), 8)
-        return {
-            "status": "ok",
-            "txid": f"SIM-CB-{int(time.time()*1000)}",
-            "fills": [{"qty": qty, "price": px}],
-            "venue": "COINBASE",
-            "symbol": symbol,
-            "side": side,
-            "executed_qty": qty,
-            "avg_price": px,
-            "message": "coinbase dryrun simulated fill"
-        }
+        qty = round(float(amount_base or (amount_quote or 0.0)/px), 8)
+        return {"status":"ok","txid":f"SIM-CB-{int(time.time()*1000)}","fills":[{"qty":qty,"price":px}],
+                "venue":"COINBASE","symbol":symbol,"side":side_uc,"executed_qty":qty,"avg_price":px,
+                "message":"coinbase dryrun simulated fill"}
 
-    # Live via CDP JWT
     try:
         cb = CoinbaseCDP()
-        resp = cb.place_market(
-            product_id=symbol, side=side,
-            quote_size=float(amount_quote or 0.0),
-            base_size=float(amount_base or 0.0),
-            client_order_id=str(client_id)
-        )
+        resp = cb.place_market(product_id=symbol, side=side_uc,
+                               quote_size=float(amount_quote or 0.0),
+                               base_size=float(amount_base or 0.0),
+                               client_order_id=str(client_id))
         try:
             data = resp.json()
         except Exception:
             data = {"raw": resp.text}
 
         if resp.status_code >= 400:
-            return {"status": "error",
-                    "message": f"{resp.status_code} {data}",
-                    "fills": [], "venue": "COINBASE", "symbol": symbol, "side": side}
+            return {"status":"error","message":f"{resp.status_code} {data}","fills":[],
+                    "venue":"COINBASE","symbol":symbol,"side":side_uc}
 
-        # Successful response shape typically includes a success_response with an order_id
         order_id = (data.get("success_response") or {}).get("order_id") or data.get("order_id") or ""
-        return {
-            "status": "ok",
-            "txid": order_id or f"CB-NOORD-{int(time.time()*1000)}",
-            "fills": data.get("fills") or [],
-            "venue": "COINBASE",
-            "symbol": symbol,
-            "side": side,
-            "message": "coinbase live order accepted" if order_id else "coinbase response parsed"
-        }
-
+        return {"status":"ok","txid":order_id or f"CB-NOORD-{int(time.time()*1000)}","fills":data.get("fills") or [],
+                "venue":"COINBASE","symbol":symbol,"side":side_uc,
+                "message":"coinbase live order accepted" if order_id else "coinbase response parsed"}
     except Exception as e:
-        return {"status": "error",
-                "message": f"coinbase executor exception: {e}",
-                "fills": [], "venue": "COINBASE", "symbol": symbol, "side": side}
+        return {"status":"error","message":f"coinbase executor exception: {e}","fills":[],
+                "venue":"COINBASE","symbol":symbol,"side":side_uc}
+
+ 
