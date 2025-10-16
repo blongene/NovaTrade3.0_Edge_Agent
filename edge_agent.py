@@ -1,43 +1,56 @@
 #!/usr/bin/env python3
-# edge_agent.py — pulls commands from cloud, executes locally, ACKs with HMAC, posts receipts
+# edge_agent.py — pulls commands from cloud, executes locally, ACKs with HMAC, posts receipts,
+# and mirrors telemetry to a local SQLite + pushes aggregates/heartbeat to Bus.
+
 import os, time, json, hmac, hashlib, requests, sys, traceback, re
 
+# --- Executors ---------------------------------------------------------------
 from executors.coinbase_advanced_executor import execute_market_order as cb_exec
 from executors.binance_us_executor import execute_market_order as bus_exec
 from executors.kraken_executor import execute_market_order as kr_exec
 
-# --- Env ---------------------------------------------------------------------
+# --- Optional Telemetry (Phase 4) -------------------------------------------
+# These modules are no-ops unless you dropped in telemetry_db.py / telemetry_sync.py
+try:
+    import telemetry_db
+except Exception:
+    telemetry_db = None
+
+try:
+    import telemetry_sync
+except Exception:
+    telemetry_sync = None
+
+# --- Env --------------------------------------------------------------------
 CLOUD_BASE_URL = os.getenv("CLOUD_BASE_URL") or os.getenv("BASE_URL") or "http://localhost:10000"
-AGENT_ID       = (os.getenv("AGENT_ID") or "edge-local").split(",")[0].strip()
+AGENT_ID       = (os.getenv("AGENT_ID") or os.getenv("EDGE_AGENT_ID") or "edge-local").split(",")[0].strip()
 EDGE_MODE      = (os.getenv("EDGE_MODE") or "dryrun").strip().lower()   # dryrun | live
 EDGE_HOLD      = (os.getenv("EDGE_HOLD") or "false").strip().lower() in {"1","true","yes"}
 EDGE_SECRET    = (os.getenv("EDGE_SECRET") or "").strip()
 EDGE_POLL_SECS = int(os.getenv("EDGE_POLL_SECS") or "10")
-HEARTBEAT_SECS = int(os.getenv("HEARTBEAT_SECS") or "60")  # 0 to disable
+
+# Heartbeat / telemetry cadence
+HEARTBEAT_SECS = int(os.getenv("HEARTBEAT_SECS") or os.getenv("HEARTBEAT_EVERY_S") or "900")  # default 15m
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "NovaTrade-Edge/1.2"})
+SESSION.headers.update({"User-Agent": "NovaTrade-Edge/1.3"})
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
-_retry = Retry(
-    total=3, connect=3, read=3, backoff_factor=0.5,
-    status_forcelist=(502, 503, 504),
-    allowed_methods=frozenset(["GET", "POST"])
-)
+_retry = Retry(total=3, connect=3, read=3, backoff_factor=0.5,
+               status_forcelist=(502, 503, 504),
+               allowed_methods=frozenset(["GET", "POST"]))
 SESSION.mount("https://", HTTPAdapter(max_retries=_retry))
 SESSION.mount("http://",  HTTPAdapter(max_retries=_retry))
 
 # Executable registry uses LETTER-ONLY KEYS to simplify venue normalization
 EXECUTORS = {
-    "COINBASE":   cb_exec,
+    "COINBASE":    cb_exec,
     "COINBASEADV": cb_exec,
-    "CBADV":      cb_exec,
-    "BINANCEUS":  bus_exec,
-    "BINANCEUS":  bus_exec,  # alias (kept idempotent)
-    "BUSA":       bus_exec,
-    "KRAKEN":     kr_exec,
+    "CBADV":       cb_exec,
+    "BINANCEUS":   bus_exec,
+    "BUSA":        bus_exec,
+    "KRAKEN":      kr_exec,
 }
 
 # --- Utils -------------------------------------------------------------------
@@ -46,16 +59,14 @@ def _log(msg: str):
     print(f"[edge] {ts} {msg}", flush=True)
 
 def _canon(d: dict) -> bytes:
-    # Canonical JSON for HMAC (stable ordering + minimal separators)
     return json.dumps(d, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
 def _hmac_hex(secret: str, raw_bytes: bytes) -> str:
     return hmac.new(secret.encode("utf-8"), raw_bytes, hashlib.sha256).hexdigest()
 
 def _post_signed(url: str, body: dict, timeout=20):
-    """POST with HMAC header. Safe to use even when server doesn't strictly require HMAC."""
     raw = _canon(body)
-    ts  = str(int(time.time() * 1000))  # optional timestamp header
+    ts  = str(int(time.time() * 1000))
     headers = {"Content-Type": "application/json"}
     if EDGE_SECRET:
         headers["X-Signature"] = _hmac_hex(EDGE_SECRET, raw)
@@ -63,20 +74,18 @@ def _post_signed(url: str, body: dict, timeout=20):
     return SESSION.post(url, data=raw, headers=headers, timeout=timeout)
 
 def _post_signed_retry(url: str, body: dict, timeout=20, retries=3):
-    """HMAC-signed POST with small retry for transient 5xx/connection hiccups."""
     for attempt in range(retries):
         try:
             r = _post_signed(url, body, timeout=timeout)
-            if r.status_code < 500:   # 2xx/3xx/4xx -> stop retrying
+            if r.status_code < 500:
                 return r
             _log(f"POST retry {attempt+1}/{retries} on {url}: {r.status_code}")
         except Exception as e:
             _log(f"POST exception {attempt+1}/{retries} on {url}: {e}")
         time.sleep(2 * (attempt + 1))
-    return _post_signed(url, body, timeout=timeout)  # final attempt
+    return _post_signed(url, body, timeout=timeout)
 
 def _venue_key(v: str) -> str:
-    """Normalize venue string to letters only (BINANCE.US/BINANCE-US/BINANCE_US → BINANCEUS)."""
     return re.sub(r"[^A-Z]", "", (v or "").upper())
 
 # --- Execution router --------------------------------------------------------
@@ -91,7 +100,7 @@ def exec_command(cmd: dict) -> dict:
     if EDGE_HOLD:
         return {"status":"held","message":"EDGE_HOLD enabled","fills":[]}
 
-    # Guardrails: produce a crisp error before we hit an executor
+    # Guardrails before executor call
     if side == "BUY" and amount_quote <= 0:
         return {"status":"error","message":"BUY requires amount_quote > 0","fills":[]}
     if side == "SELL" and amount_base <= 0:
@@ -104,7 +113,7 @@ def exec_command(cmd: dict) -> dict:
             client_id=str(cmd.get("id")), edge_mode=EDGE_MODE, edge_hold=EDGE_HOLD
         )
 
-    # Fallback (dryrun)
+    # Fallback in dryrun
     if EDGE_MODE != "live":
         px = 60000.0
         qty = amount_base or (amount_quote/px if amount_quote else 0)
@@ -159,7 +168,6 @@ def ack_command(cmd_id: int, result: dict):
             _log(f"ack exception {attempt+1}/3 for {cmd_id}: {e}")
         time.sleep(2 * (attempt + 1))
 
-    # final hard attempt
     try:
         r = SESSION.post(url, data=raw, headers=headers, timeout=20)
         if r.status_code < 400:
@@ -174,7 +182,7 @@ def ack_command(cmd_id: int, result: dict):
 def post_receipt(cmd: dict, exec_result: dict):
     """
     Best-effort mirror of execution into cloud receipts → Google Sheet.
-    Server is idempotent on 'id', so retries won't double-log.
+    Includes provenance if executors returned it.
     """
     if not EDGE_SECRET:
         _log("WARN: EDGE_SECRET missing; skipping receipt post")
@@ -191,21 +199,34 @@ def post_receipt(cmd: dict, exec_result: dict):
         "fills": exec_result.get("fills", []),
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "note": exec_result.get("message", ""),
+        # Provenance / Telemetry fields (optional)
+        "requested_symbol": exec_result.get("requested_symbol"),
+        "resolved_symbol":  exec_result.get("resolved_symbol") or exec_result.get("symbol"),
+        "post_balances":    exec_result.get("post_balances"),
     }
-    canon = _canon(payload)
-    payload["hmac"] = _hmac_hex(EDGE_SECRET, canon)  # sign canonical payload (without 'hmac')
+    canon = _canon({k: v for k, v in payload.items() if k != "hmac"})
+    payload["hmac"] = _hmac_hex(EDGE_SECRET, canon)
 
     url = CLOUD_BASE_URL.rstrip("/") + "/api/receipts/ack"
     try:
-        # more patient + retry for transient slowdowns
         r = _post_signed_retry(url, payload, timeout=30, retries=3)
-        _log(f"posted receipt {cmd['id']}: {r.status_code} {r.text[:120]}")
+        _log(f"posted receipt {cmd['id']}: {r.status_code} {r.text[:160]}")
     except Exception as e:
         _log(f"receipt post failed for {cmd['id']}: {e}")
 
-# --- Optional heartbeat ------------------------------------------------------
+    # Local telemetry mirror (Phase 4)
+    if telemetry_db:
+        try:
+            telemetry_db.log_receipt(cmd_id=str(cmd.get("id")), receipt=exec_result)
+            pb = exec_result.get("post_balances")
+            if isinstance(pb, dict):
+                telemetry_db.upsert_balances(venue=exec_result.get("venue"), bal_map=pb)
+        except Exception as e:
+            _log(f"telemetry mirror error: {e}")
+
+# --- Telemetry heartbeat/push ------------------------------------------------
 _last_hb = 0
-def maybe_heartbeat():
+def maybe_telemetry_tick():
     global _last_hb
     if HEARTBEAT_SECS <= 0:
         return
@@ -213,27 +234,30 @@ def maybe_heartbeat():
     if now - _last_hb < HEARTBEAT_SECS:
         return
     _last_hb = now
-    try:
-        url = CLOUD_BASE_URL.rstrip("/") + "/ops/heartbeat"
-        body = {
-            "agent_id": AGENT_ID,
-            "mode": EDGE_MODE,
-            "hold": EDGE_HOLD,
-            "ts": int(now * 1000),
-        }
-        r = _post_signed(url, body, timeout=5)
-        # Endpoint might not exist; keep quiet unless server returns 5xx
-        if r.status_code >= 500:
-            _log(f"heartbeat 5xx: {r.status_code}")
-    except Exception:
-        # stay silent; heartbeat is best-effort only
-        pass
 
-# --- Poll loop ---------------------------------------------------------------
+    # Local heartbeat row
+    if telemetry_db:
+        try:
+            telemetry_db.log_heartbeat(agent=AGENT_ID, ok=True, latency_ms=0)
+        except Exception:
+            pass
+
+    # Push heartbeat + aggregates to Bus
+    if telemetry_sync:
+        try:
+            telemetry_sync.send_heartbeat(latency_ms=0)
+        except Exception as e:
+            _log(f"heartbeat push error: {e}")
+        try:
+            telemetry_sync.push_telemetry()
+        except Exception as e:
+            _log(f"telemetry push error: {e}")
+
+# --- Pull loop ---------------------------------------------------------------
 def pull_once(max_n=5):
     url  = CLOUD_BASE_URL.rstrip("/") + "/api/commands/pull"
     body = {"agent_id": AGENT_ID, "max": max_n}
-    r = _post_signed(url, body, timeout=20)  # always signed (works with REQUIRE_HMAC_PULL=1 or 0)
+    r = _post_signed(url, body, timeout=20)
     r.raise_for_status()
     items = r.json()
     return items if isinstance(items, list) else []
@@ -261,14 +285,13 @@ def main():
                 except Exception as e:
                     _log(f"ack exception {cid}: {e}")
 
-                # Post receipt only after a successful ACK (keeps bus as source of truth)
                 if ack_ok:
                     try:
                         post_receipt(cmd, res)
                     except Exception as e:
                         _log(f"post_receipt exception {cid}: {e}")
 
-            maybe_heartbeat()
+            maybe_telemetry_tick()
             backoff = 2
         except requests.HTTPError as he:
             try:
