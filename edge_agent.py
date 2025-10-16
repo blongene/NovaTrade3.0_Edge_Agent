@@ -8,6 +8,9 @@ import os, time, json, hmac, hashlib, requests, sys, traceback, re
 from executors.coinbase_advanced_executor import execute_market_order as cb_exec
 from executors.binance_us_executor import execute_market_order as bus_exec
 from executors.kraken_executor import execute_market_order as kr_exec
+from executors.coinbase_advanced_executor import CoinbaseCDP
+from executors.binance_us_executor import BinanceUS
+from executors.kraken_executor import _balance as kraken_balance
 
 # --- Optional Telemetry (Phase 4) -------------------------------------------
 # These modules are no-ops unless you dropped in telemetry_db.py / telemetry_sync.py
@@ -260,6 +263,42 @@ def maybe_telemetry_tick():
                 _log(f"telemetry push: {tp}")
         except Exception as e:
             _log(f"telemetry push error: {e}")
+            
+BALANCE_SNAPSHOT_SECS = int(os.getenv("BALANCE_SNAPSHOT_SECS", "7200"))  # every 2h
+_last_bal_snap = 0
+
+def maybe_balance_snapshot():
+    global _last_bal_snap
+    if not telemetry_db:
+        return
+    now = time.time()
+    if now - _last_bal_snap < BALANCE_SNAPSHOT_SECS:
+        return
+    _last_bal_snap = now
+    # Coinbase
+    try:
+        cb = CoinbaseCDP()
+        bals = cb.balances()  # {"USDC": ..., "BTC": ...}
+        telemetry_db.upsert_balances("COINBASE", bals)
+        _log(f"snapshot COINBASE balances: { {k: round(v,8) for k,v in bals.items() if k in ('USDC','BTC')} }")
+    except Exception as e:
+        _log(f"snapshot COINBASE error: {e}")
+    # Binance.US
+    try:
+        bus = BinanceUS()
+        acct = bus.account()
+        bals = { (b.get('asset') or '').upper(): float(b.get('free') or 0.0) for b in (acct.get('balances') or []) }
+        telemetry_db.upsert_balances("BINANCEUS", bals)
+        _log(f"snapshot BINANCEUS balances: { {k: round(v,8) for k,v in bals.items() if k in ('USDT','BTC')} }")
+    except Exception as e:
+        _log(f"snapshot BINANCEUS error: {e}")
+    # Kraken
+    try:
+        bals = kraken_balance()  # {"USDT": ..., "XBT": ...}
+        telemetry_db.upsert_balances("KRAKEN", bals)
+        _log(f"snapshot KRAKEN balances: { {k: round(v,8) for k,v in bals.items() if k in ('USDT','XBT')} }")
+    except Exception as e:
+        _log(f"snapshot KRAKEN error: {e}")
 
 # --- Pull loop ---------------------------------------------------------------
 def pull_once(max_n=5):
