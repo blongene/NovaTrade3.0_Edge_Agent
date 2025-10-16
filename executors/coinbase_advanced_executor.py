@@ -1,57 +1,37 @@
 # executors/coinbase_advanced_executor.py
-# Advanced Trade (CDP) auth via JWT using a CDP secret file (cdp_api_key.json)
+# Coinbase Advanced Trade via CDP JWT. BUY uses quote_size; SELL uses base_size.
 import os, time, json, requests
+from typing import Dict, Any
 
 CB_BASE       = os.getenv("COINBASE_BASE_URL", "https://api.coinbase.com").rstrip("/")
 ORDERS_PATH   = "/api/v3/brokerage/orders"
+ACCTS_PATH    = "/api/v3/brokerage/accounts"
 TIMEOUT_S     = int(os.getenv("COINBASE_TIMEOUT_S", "20"))
 CDP_KEY_PATH  = os.getenv("COINBASE_CDP_KEY_PATH", "cdp_api_key.json").strip()
-UA            = "NovaTrade-Edge-CBAdv/2.0"
+UA            = "NovaTrade-Edge-CBAdv/2.1"
 
-# We rely on Coinbase's official helper for correct JWT formatting/claims.
-#   pip install coinbase-advanced-py
+# Requires: pip install coinbase-advanced-py
 try:
     from coinbase import jwt_generator
-except Exception as _e:
+except Exception:
     jwt_generator = None
 
 def _load_cdp_creds():
-    """
-    Reads the CDP secret from:
-      1) COINBASE_CDP_KEY_PATH (JSON with fields: {"name": "...", "privateKey": "...PEM..."})
-      2) or env fallbacks: COINBASE_CDP_API_KEY_NAME + COINBASE_CDP_PRIVATE_KEY
-    Returns (key_name, private_key_pem) or (None, None) if missing.
-    """
-    key_name = None
-    private_key = None
-
-    # Preferred: secret file
+    key_name = None; private_key = None
     if CDP_KEY_PATH and os.path.exists(CDP_KEY_PATH):
         try:
             with open(CDP_KEY_PATH, "r", encoding="utf-8") as f:
-                j = json.load(f)
-            key_name   = (j.get("name") or "").strip()
-            private_key = (j.get("privateKey") or "").strip()
-        except Exception:
-            key_name, private_key = None, None
-
-    # Fallback: env vars
+                j = json.load(f); key_name=(j.get("name") or "").strip(); private_key=(j.get("privateKey") or "").strip()
+        except Exception: pass
     if not key_name or not private_key:
         key_name = (os.getenv("COINBASE_CDP_API_KEY_NAME") or "").strip()
         private_key = (os.getenv("COINBASE_CDP_PRIVATE_KEY") or "").strip()
-
-    return (key_name if key_name else None,
-            private_key if private_key else None)
+    return (key_name if key_name else None, private_key if private_key else None)
 
 class CoinbaseCDP:
-    """
-    Minimal CDP client for Advanced Trade REST calls:
-      - Generates a short-lived JWT per request with the official helper.
-      - Sends Authorization: Bearer <jwt>
-    """
     def __init__(self):
-        self.base  = CB_BASE
-        self.sess  = requests.Session()
+        self.base = CB_BASE
+        self.sess = requests.Session()
         self.sess.headers.update({"User-Agent": UA})
         self.key_name, self.private_key = _load_cdp_creds()
 
@@ -59,93 +39,106 @@ class CoinbaseCDP:
         if not jwt_generator:
             raise RuntimeError("coinbase-advanced-py is required (pip install coinbase-advanced-py)")
         if not (self.key_name and self.private_key):
-            raise RuntimeError("Missing CDP creds: set COINBASE_CDP_KEY_PATH or COINBASE_CDP_API_KEY_NAME/COINBASE_CDP_PRIVATE_KEY")
+            raise RuntimeError("Missing CDP creds (COINBASE_CDP_KEY_PATH or env pair)")
 
     def _bearer_for(self, method: str, path: str) -> str:
-        """
-        Build a per-request JWT for the REST endpoint.
-        Tokens expire quickly (~2 minutes); always create fresh per call.
-        """
         self._ensure_ready()
         uri = jwt_generator.format_jwt_uri(method.upper(), path)
         return jwt_generator.build_rest_jwt(uri, self.key_name, self.private_key)
 
-    def _post_retry(self, path: str, body: dict, tries=3):
-        raw = json.dumps(body, separators=(",", ":"), sort_keys=True)
+    def _call(self, method: str, path: str, *, body: Dict[str, Any] | None = None, tries=3):
+        raw = json.dumps(body or {}, separators=(",", ":"), sort_keys=True)
         for i in range(tries):
-            token = self._bearer_for("POST", path)
             hdrs = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": UA,
+                "Authorization": f"Bearer {self._bearer_for(method, path)}",
+                "Accept": "application/json", "Content-Type": "application/json", "User-Agent": UA,
             }
-            r = self.sess.post(self.base + path, data=raw, headers=hdrs, timeout=TIMEOUT_S)
+            url = self.base + path
+            r = self.sess.request(method.upper(), url, data=(raw if body is not None else None),
+                                  headers=hdrs, timeout=TIMEOUT_S)
             if r.status_code < 500:
                 return r
-            time.sleep(1.5 * (i + 1))
+            time.sleep(1.25 * (i + 1))
         return r
 
+    # ---- public helpers ----
     def place_market(self, *, product_id: str, side: str,
                      quote_size: float = 0.0, base_size: float = 0.0,
                      client_order_id: str = ""):
-        """
-        For BUY: use quote_size (e.g., USDC amount).
-        For SELL: use base_size  (e.g., BTC quantity).
-        """
         side_uc = (side or "").upper()
-        if side_uc not in {"BUY", "SELL"}:
-            raise ValueError(f"invalid side: {side}")
-
-        if side_uc == "BUY":
-            cfg = {"market_market_ioc": {"quote_size": str(float(quote_size or 0.0))}}
-        else:
-            cfg = {"market_market_ioc": {"base_size":  str(float(base_size  or 0.0))}}
-
+        if side_uc not in {"BUY","SELL"}: raise ValueError("invalid side")
+        cfg = ({"market_market_ioc": {"quote_size": str(float(quote_size or 0.0))}} if side_uc=="BUY"
+               else {"market_market_ioc": {"base_size":  str(float(base_size  or 0.0))}})
         body = {
             "client_order_id": str(client_order_id or f"NT-{int(time.time()*1000)}"),
-            "product_id": product_id,   # e.g., BTC-USDC
-            "side": side_uc,            # MUST be uppercase: BUY | SELL
-            "order_configuration": cfg
+            "product_id": product_id, "side": side_uc, "order_configuration": cfg,
         }
-        return self._post_retry(ORDERS_PATH, body)
+        return self._call("POST", ORDERS_PATH, body=body)
+
+    def balances(self) -> Dict[str, float]:
+        """Return {asset_symbol: available_float} using brokerage accounts list."""
+        r = self._call("GET", ACCTS_PATH, body=None)
+        j = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+        out: Dict[str, float] = {}
+        for a in (j.get("accounts") or []):
+            sym = (a.get("currency") or a.get("asset_id") or "").upper()
+            try:
+                av = float((a.get("available_balance") or {}).get("value") or 0)
+            except Exception:
+                av = 0.0
+            if sym: out[sym] = av
+        return out
+
+def _norm_symbol(venue_symbol: str) -> str:
+    # BTC/USDC -> BTC-USDC; enforce USDC for Coinbase quote
+    s = venue_symbol.replace("/", "-").upper()
+    if s.endswith("-USDT"):
+        # Coinbase typically lists USDT as well, but your canary used USDC;
+        # keep what user asked for to avoid surprises.
+        pass
+    return s
 
 def execute_market_order(*, venue_symbol: str, side: str,
                          amount_quote: float = 0.0, amount_base: float = 0.0,
-                         client_id: str = "", edge_mode: str = "dryrun", edge_hold: bool = False, **_):
-    symbol = venue_symbol.replace("/", "-").upper()  # BTC/USDC → BTC-USDC
+                         client_id: str = "", edge_mode: str = "dryrun",
+                         edge_hold: bool = False, **_):
+    symbol = _norm_symbol(venue_symbol)
     side_uc = (side or "").upper()
 
-    # SELL requires base qty; BUY requires quote amount
-    if edge_mode == "live" and side_uc == "SELL" and not amount_base:
-        return {"status":"error","message":"Coinbase MARKET SELL requires base amount (amount_base)","fills":[],
-                "venue":"COINBASE","symbol":symbol,"side":side_uc}
-    if edge_mode == "live" and side_uc == "BUY" and not amount_quote:
-        return {"status":"error","message":"Coinbase MARKET BUY requires quote amount (amount_quote)","fills":[],
-                "venue":"COINBASE","symbol":symbol,"side":side_uc}
-
+    # HOLD / DRYRUN
     if edge_hold:
         return {"status":"held","message":"EDGE_HOLD enabled","fills":[],
                 "venue":"COINBASE","symbol":symbol,"side":side_uc}
-
     if edge_mode != "live":
         px = 60000.0
-        qty = round(float(amount_base or (amount_quote or 0.0)/px), 8)
+        qty = round(float(amount_base or (amount_quote or 0)/px), 8)
         return {"status":"ok","txid":f"SIM-CB-{int(time.time()*1000)}","fills":[{"qty":qty,"price":px}],
                 "venue":"COINBASE","symbol":symbol,"side":side_uc,"executed_qty":qty,"avg_price":px,
                 "message":"coinbase dryrun simulated fill"}
 
+    # LIVE
     try:
         cb = CoinbaseCDP()
-        resp = cb.place_market(product_id=symbol, side=side_uc,
-                               quote_size=float(amount_quote or 0.0),
-                               base_size=float(amount_base or 0.0),
-                               client_order_id=str(client_id))
-        try:
-            data = resp.json()
-        except Exception:
-            data = {"raw": resp.text}
+        # Clamp SELL to free BTC so we never exceed balance on tiny canaries
+        if side_uc == "SELL":
+            bals = cb.balances()
+            base_ccy = symbol.split("-")[0]  # BTC
+            free = float(bals.get(base_ccy, 0.0))
+            qty = min(max(0.0, float(amount_base or 0.0)), max(0.0, free - 1e-8))
+            qty = float(f"{qty:.8f}")  # Coinbase allows 8 dp on BTC size
+            if qty <= 0:
+                return {"status":"error","message":"Insufficient free balance after clamp","fills":[],
+                        "venue":"COINBASE","symbol":symbol,"side":side_uc}
+            resp = cb.place_market(product_id=symbol, side=side_uc, base_size=qty, client_order_id=str(client_id))
+        else:  # BUY
+            if not amount_quote or float(amount_quote) <= 0:
+                return {"status":"error","message":"BUY requires amount_quote","fills":[],
+                        "venue":"COINBASE","symbol":symbol,"side":side_uc}
+            resp = cb.place_market(product_id=symbol, side=side_uc, quote_size=float(amount_quote or 0.0),
+                                   client_order_id=str(client_id))
 
+        try: data = resp.json()
+        except Exception: data = {"raw": resp.text}
         if resp.status_code >= 400:
             return {"status":"error","message":f"{resp.status_code} {data}","fills":[],
                     "venue":"COINBASE","symbol":symbol,"side":side_uc}
@@ -157,5 +150,3 @@ def execute_market_order(*, venue_symbol: str, side: str,
     except Exception as e:
         return {"status":"error","message":f"coinbase executor exception: {e}","fills":[],
                 "venue":"COINBASE","symbol":symbol,"side":side_uc}
-
- 
