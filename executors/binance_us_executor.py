@@ -73,6 +73,7 @@ def execute_market_order(*, venue_symbol: str, side: str,
                          amount_quote: float = 0.0, amount_base: float = 0.0,
                          client_id: str = "", edge_mode: str = "dryrun",
                          edge_hold: bool = False, **_):
+    requested = venue_symbol.upper()
     symbol = _symbol_norm(venue_symbol)  # e.g., BTCUSDT
     if edge_hold:
         return {"status":"held","message":"EDGE_HOLD enabled","fills":[],"venue":"BINANCEUS","symbol":symbol,"side":side}
@@ -103,6 +104,30 @@ def execute_market_order(*, venue_symbol: str, side: str,
         min_notional = float(filters.get("NOTIONAL", {}).get("minNotional", "0"))
     except Exception:
         step, min_qty, min_notional = 1e-5, 1e-5, 0.0
+
+    if side.upper() == "BUY":
+    acct = bus.account()
+    free_usdt = 0.0
+    for b in acct.get("balances", []):
+        if (b.get("asset") or "").upper() == "USDT":
+            try: free_usdt = float(b.get("free") or 0.0)
+            except: pass
+    if float(amount_quote or 0.0) > free_usdt:
+        return {"status":"error","message":f"insufficient USDT: have {free_usdt:.2f}, need {amount_quote:.2f}",
+                "fills":[], "venue":"BINANCEUS","symbol":symbol,"requested_symbol":requested,"resolved_symbol":symbol,"side":side}
+    post = {"USDT": free_usdt, "BTC": 0.0}
+    try:
+        acct2 = bus.account()
+        for b in acct2.get("balances", []):
+            a = (b.get("asset") or "").upper()
+            if a in ("USDT","BTC"):
+                post[a] = float(b.get("free") or 0.0)
+    except: pass
+
+    return {"status":"ok", "txid": str(order_id) or ...,
+            "venue":"BINANCEUS","symbol":symbol,
+            "requested_symbol":requested,"resolved_symbol":symbol,
+            "side":side, "post_balances": post, "message":"binanceus live order accepted"}    
 
     # Free balance clamp for SELL
     if side.upper() == "SELL":
