@@ -226,6 +226,8 @@ def post_receipt(cmd: dict, exec_result: dict):
 
 # --- Telemetry heartbeat/push ------------------------------------------------
 _last_hb = 0
+TELEMETRY_VERBOSE = (os.getenv("TELEMETRY_VERBOSE") or "0").strip() in {"1","true","yes"}
+
 def maybe_telemetry_tick():
     global _last_hb
     if HEARTBEAT_SECS <= 0:
@@ -239,17 +241,23 @@ def maybe_telemetry_tick():
     if telemetry_db:
         try:
             telemetry_db.log_heartbeat(agent=AGENT_ID, ok=True, latency_ms=0)
-        except Exception:
-            pass
+            if TELEMETRY_VERBOSE:
+                _log("telemetry_db: heartbeat row inserted")
+        except Exception as e:
+            _log(f"telemetry_db heartbeat error: {e}")
 
     # Push heartbeat + aggregates to Bus
     if telemetry_sync:
         try:
-            telemetry_sync.send_heartbeat(latency_ms=0)
+            hb = telemetry_sync.send_heartbeat(latency_ms=0)
+            if TELEMETRY_VERBOSE:
+                _log(f"heartbeat push: {hb}")
         except Exception as e:
             _log(f"heartbeat push error: {e}")
         try:
-            telemetry_sync.push_telemetry()
+            tp = telemetry_sync.push_telemetry()
+            if TELEMETRY_VERBOSE:
+                _log(f"telemetry push: {tp}")
         except Exception as e:
             _log(f"telemetry push error: {e}")
 
