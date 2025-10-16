@@ -339,6 +339,7 @@ def main():
                         _log(f"post_receipt exception {cid}: {e}")
 
             maybe_telemetry_tick()
+            maybe_balance_snapshot()
             backoff = 2
         except requests.HTTPError as he:
             try:
