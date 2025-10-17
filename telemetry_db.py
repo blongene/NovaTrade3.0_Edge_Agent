@@ -47,6 +47,21 @@ CREATE TABLE IF NOT EXISTS heartbeats (
 CREATE INDEX IF NOT EXISTS idx_hb_ts ON heartbeats(ts);
 """
 
+# Add near top
+HEADLINE = {"USDT","USDC","USD","BTC","XBT","ETH"}
+
+def _clean_balances(bal_map):
+    out = {}
+    for k, v in (bal_map or {}).items():
+        k_up = (k or "").upper()
+        try:
+            val = float(v or 0.0)
+        except Exception:
+            val = 0.0
+        if val != 0.0 or k_up in HEADLINE:
+            out[k_up] = val
+    return out
+
 def _conn():
     first = not os.path.exists(DB_PATH)
     con = sqlite3.connect(DB_PATH, isolation_level=None, timeout=10)
@@ -81,6 +96,7 @@ def log_receipt(*, cmd_id: str, receipt: Dict[str, Any]):
 def upsert_balances(venue: str, bal_map: Dict[str, float], ts: Optional[int] = None):
     con = _conn()
     t = int(ts or time.time())
+    bal_map = _clean_balances(bal_map)
     for asset, free in (bal_map or {}).items():
         if asset is None: continue
         con.execute(
