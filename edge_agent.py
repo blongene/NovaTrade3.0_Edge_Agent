@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-# edge_agent.py — pulls commands from cloud, executes locally, ACKs with HMAC, posts receipts,
-# and mirrors telemetry to a local SQLite + pushes aggregates/heartbeat to Bus.
+# edge_agent.py — NovaTrade Edge Agent (Phase 5)
+# - Polls commands from Bus, executes locally, ACKs with HMAC, posts receipts
+# - Works with both legacy pull format (list) and new format {"ok":true,"commands":[...]}
 
-import os, time, json, hmac, hashlib, requests, sys, traceback, re
+import os, time, json, hmac, hashlib, requests, sys, traceback, re, collections
 
-# --- Executors ---------------------------------------------------------------
+# --- Venue executors (existing modules) --------------------------------------
 from executors.coinbase_advanced_executor import execute_market_order as cb_exec
 from executors.binance_us_executor import execute_market_order as bus_exec
 from executors.kraken_executor import execute_market_order as kr_exec
@@ -12,8 +13,7 @@ from executors.coinbase_advanced_executor import CoinbaseCDP
 from executors.binance_us_executor import BinanceUS
 from executors.kraken_executor import _balance as kraken_balance
 
-# --- Optional Telemetry (Phase 4) -------------------------------------------
-# These modules are no-ops unless you dropped in telemetry_db.py / telemetry_sync.py
+# --- Optional telemetry (Phase 4) -------------------------------------------
 try:
     import telemetry_db
 except Exception:
@@ -24,7 +24,7 @@ try:
 except Exception:
     telemetry_sync = None
 
-# --- Env --------------------------------------------------------------------
+# --- Env ---------------------------------------------------------------------
 CLOUD_BASE_URL = os.getenv("CLOUD_BASE_URL") or os.getenv("BASE_URL") or "http://localhost:10000"
 AGENT_ID       = (os.getenv("AGENT_ID") or os.getenv("EDGE_AGENT_ID") or "edge-local").split(",")[0].strip()
 EDGE_MODE      = (os.getenv("EDGE_MODE") or "dryrun").strip().lower()   # dryrun | live
@@ -34,10 +34,12 @@ EDGE_POLL_SECS = int(os.getenv("EDGE_POLL_SECS") or "10")
 
 # Heartbeat / telemetry cadence
 HEARTBEAT_SECS = int(os.getenv("HEARTBEAT_SECS") or os.getenv("HEARTBEAT_EVERY_S") or "900")  # default 15m
+BALANCE_SNAPSHOT_SECS = int(os.getenv("BALANCE_SNAPSHOT_SECS", "7200"))  # every 2h
+TELEMETRY_VERBOSE = (os.getenv("TELEMETRY_VERBOSE") or "0").strip() in {"1","true","yes"}
 
+# --- HTTP session with retry -------------------------------------------------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "NovaTrade-Edge/1.3"})
-
+SESSION.headers.update({"User-Agent": "NovaTrade-Edge/1.4"})
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 _retry = Retry(total=3, connect=3, read=3, backoff_factor=0.5,
@@ -46,7 +48,7 @@ _retry = Retry(total=3, connect=3, read=3, backoff_factor=0.5,
 SESSION.mount("https://", HTTPAdapter(max_retries=_retry))
 SESSION.mount("http://",  HTTPAdapter(max_retries=_retry))
 
-# Executable registry uses LETTER-ONLY KEYS to simplify venue normalization
+# --- Executors registry ------------------------------------------------------
 EXECUTORS = {
     "COINBASE":    cb_exec,
     "COINBASEADV": cb_exec,
@@ -91,24 +93,56 @@ def _post_signed_retry(url: str, body: dict, timeout=20, retries=3):
 def _venue_key(v: str) -> str:
     return re.sub(r"[^A-Z]", "", (v or "").upper())
 
-# --- Execution router --------------------------------------------------------
-def exec_command(cmd: dict) -> dict:
-    p = cmd.get("payload") or {}
+# --- Normalize command payload ----------------------------------------------
+def _normalize_payload(p: dict):
+    """
+    Make sense of different payload variants:
+      - amount_usd (quote)
+      - amount / quote_amount (quote)
+      - base_amount (base)
+    Returns tuple: (venue_key, side, symbol, amount_quote, amount_base)
+    """
     venue_key = _venue_key(p.get("venue"))
     side      = (p.get("side") or "").upper()
     symbol    = p.get("symbol") or p.get("product_id") or ""
-    amount_quote = float(p.get("amount") or p.get("quote_amount") or 0)
-    amount_base  = float(p.get("base_amount") or 0)
+
+    # quote amount (USD/USDT/USDC)
+    amount_quote = None
+    for k in ("amount_usd", "quote_amount", "amount"):
+        if p.get(k) is not None:
+            try:
+                amount_quote = float(p.get(k))
+                break
+            except Exception:
+                pass
+    if amount_quote is None:
+        amount_quote = 0.0
+
+    # base amount (sell)
+    amount_base = 0.0
+    if p.get("base_amount") is not None:
+        try:
+            amount_base = float(p.get("base_amount"))
+        except Exception:
+            amount_base = 0.0
+
+    return venue_key, side, symbol, float(amount_quote or 0.0), float(amount_base or 0.0)
+
+# --- Execution router --------------------------------------------------------
+def exec_command(cmd: dict) -> dict:
+    p = cmd.get("payload") or {}
+    venue_key, side, symbol, amount_quote, amount_base = _normalize_payload(p)
 
     if EDGE_HOLD:
         return {"status":"held","message":"EDGE_HOLD enabled","fills":[]}
 
-    # Guardrails before executor call
+    # Guardrails
     if side == "BUY" and amount_quote <= 0:
         return {"status":"error","message":"BUY requires amount_quote > 0","fills":[]}
     if side == "SELL" and amount_base <= 0:
         return {"status":"error","message":"SELL requires amount_base > 0","fills":[]}
 
+    # Live executors
     if venue_key in EXECUTORS:
         return EXECUTORS[venue_key](
             venue_symbol=symbol, side=side,
@@ -132,61 +166,40 @@ def exec_command(cmd: dict) -> dict:
         }
     return {"status":"error","message": f"live mode venue not implemented: {venue_key}", "fills":[]}
 
-# --- ACK with header HMAC ----------------------------------------------------
-def ack_command(cmd_id: int, result: dict):
-    if not EDGE_SECRET:
-        _log("WARN: EDGE_SECRET missing; cannot ACK with HMAC")
-        return False
-
+# --- ACK (new Bus format) ----------------------------------------------------
+def ack_command_new(cmd_id: int, exec_result: dict):
+    """
+    New Bus ack: POST /api/commands/ack with body:
+      { "id": <int>, "status": "DONE"|"ERROR"|"HELD", "receipt": {...} }
+    Signed with X-Signature/X-Timestamp if EDGE_SECRET is set.
+    """
+    status = "DONE" if exec_result.get("status") in {"ok","held"} else "ERROR"
     body = {
         "id": cmd_id,
-        "agent_id": AGENT_ID,
-        "ok": (result.get("status") == "ok"),
-        "status": result.get("status"),
-        "txid": result.get("txid"),
-        "fills": result.get("fills", []),
-        "message": result.get("message"),
-        "result": result or {},
-        "ts": int(time.time() * 1000),
-    }
-    raw = _canon(body)
-    headers = {
-        "Content-Type": "application/json",
-        "X-Signature": _hmac_hex(EDGE_SECRET, raw),
-        "X-Timestamp": str(body["ts"]),
+        "status": status,
+        "receipt": {
+            "agent_id": AGENT_ID,
+            "status": exec_result.get("status"),
+            "txid": exec_result.get("txid"),
+            "fills": exec_result.get("fills", []),
+            "message": exec_result.get("message"),
+            "venue": exec_result.get("venue"),
+            "symbol": exec_result.get("symbol"),
+            "side": exec_result.get("side"),
+            "result": exec_result,
+            "ts": int(time.time())
+        }
     }
     url = CLOUD_BASE_URL.rstrip("/") + "/api/commands/ack"
-
-    for attempt in range(3):
-        try:
-            r = SESSION.post(url, data=raw, headers=headers, timeout=20)
-            if r.status_code < 500:
-                if r.status_code >= 400:
-                    _log(f"ack failed {cmd_id}: {r.status_code} {r.text}")
-                    return False
-                _log(f"ack ok {cmd_id}: {r.status_code} {r.text}")
-                return True
-            _log(f"ack retry {attempt+1}/3 for {cmd_id}: {r.status_code}")
-        except Exception as e:
-            _log(f"ack exception {attempt+1}/3 for {cmd_id}: {e}")
-        time.sleep(2 * (attempt + 1))
-
-    try:
-        r = SESSION.post(url, data=raw, headers=headers, timeout=20)
-        if r.status_code < 400:
-            _log(f"ack ok {cmd_id}: {r.status_code} {r.text}")
-            return True
-        _log(f"ack failed {cmd_id}: {r.status_code} {r.text}")
-    except Exception as e:
-        _log(f"ack final exception for {cmd_id}: {e}")
-    return False
+    r = _post_signed_retry(url, body, timeout=20, retries=3)
+    if r.status_code >= 400:
+        _log(f"ack NEW failed {cmd_id}: {r.status_code} {r.text[:160]}")
+        return False
+    _log(f"ack NEW ok {cmd_id}: {r.status_code}")
+    return True
 
 # --- Receipts: post to /api/receipts/ack ------------------------------------
 def post_receipt(cmd: dict, exec_result: dict):
-    """
-    Best-effort mirror of execution into cloud receipts → Google Sheet.
-    Includes provenance if executors returned it.
-    """
     if not EDGE_SECRET:
         _log("WARN: EDGE_SECRET missing; skipping receipt post")
         return
@@ -202,7 +215,7 @@ def post_receipt(cmd: dict, exec_result: dict):
         "fills": exec_result.get("fills", []),
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "note": exec_result.get("message", ""),
-        # Provenance / Telemetry fields (optional)
+        # Optional provenance / balances
         "requested_symbol": exec_result.get("requested_symbol"),
         "resolved_symbol":  exec_result.get("resolved_symbol") or exec_result.get("symbol"),
         "post_balances":    exec_result.get("post_balances"),
@@ -217,7 +230,6 @@ def post_receipt(cmd: dict, exec_result: dict):
     except Exception as e:
         _log(f"receipt post failed for {cmd['id']}: {e}")
 
-    # Local telemetry mirror (Phase 4)
     if telemetry_db:
         try:
             telemetry_db.log_receipt(cmd_id=str(cmd.get("id")), receipt=exec_result)
@@ -227,9 +239,9 @@ def post_receipt(cmd: dict, exec_result: dict):
         except Exception as e:
             _log(f"telemetry mirror error: {e}")
 
-# --- Telemetry heartbeat/push ------------------------------------------------
+# --- Telemetry / heartbeat ---------------------------------------------------
 _last_hb = 0
-TELEMETRY_VERBOSE = (os.getenv("TELEMETRY_VERBOSE") or "0").strip() in {"1","true","yes"}
+_last_bal_snap = 0
 
 def maybe_telemetry_tick():
     global _last_hb
@@ -239,8 +251,6 @@ def maybe_telemetry_tick():
     if now - _last_hb < HEARTBEAT_SECS:
         return
     _last_hb = now
-
-    # Local heartbeat row
     if telemetry_db:
         try:
             telemetry_db.log_heartbeat(agent=AGENT_ID, ok=True, latency_ms=0)
@@ -248,8 +258,6 @@ def maybe_telemetry_tick():
                 _log("telemetry_db: heartbeat row inserted")
         except Exception as e:
             _log(f"telemetry_db heartbeat error: {e}")
-
-    # Push heartbeat + aggregates to Bus
     if telemetry_sync:
         try:
             hb = telemetry_sync.send_heartbeat(latency_ms=0)
@@ -263,9 +271,6 @@ def maybe_telemetry_tick():
                 _log(f"telemetry push: {tp}")
         except Exception as e:
             _log(f"telemetry push error: {e}")
-            
-BALANCE_SNAPSHOT_SECS = int(os.getenv("BALANCE_SNAPSHOT_SECS", "7200"))  # every 2h
-_last_bal_snap = 0
 
 def maybe_balance_snapshot():
     global _last_bal_snap
@@ -278,7 +283,7 @@ def maybe_balance_snapshot():
     # Coinbase
     try:
         cb = CoinbaseCDP()
-        bals = cb.balances()  # {"USDC": ..., "BTC": ...}
+        bals = cb.balances()
         telemetry_db.upsert_balances("COINBASE", bals)
         _log(f"snapshot COINBASE balances: { {k: round(v,8) for k,v in bals.items() if k in ('USDC','BTC')} }")
     except Exception as e:
@@ -294,31 +299,67 @@ def maybe_balance_snapshot():
         _log(f"snapshot BINANCEUS error: {e}")
     # Kraken
     try:
-        bals = kraken_balance()  # {"USDT": ..., "XBT": ...}
+        bals = kraken_balance()
         telemetry_db.upsert_balances("KRAKEN", bals)
         _log(f"snapshot KRAKEN balances: { {k: round(v,8) for k,v in bals.items() if k in ('USDT','XBT')} }")
     except Exception as e:
         _log(f"snapshot KRAKEN error: {e}")
 
-# --- Pull loop ---------------------------------------------------------------
-def pull_once(max_n=5):
-    url  = CLOUD_BASE_URL.rstrip("/") + "/api/commands/pull"
-    body = {"agent_id": AGENT_ID, "max": max_n}
-    r = _post_signed(url, body, timeout=20)
-    r.raise_for_status()
-    items = r.json()
-    return items if isinstance(items, list) else []
+# --- Pull loop (supports legacy & new) ---------------------------------------
+def _parse_pull_response(r):
+    """
+    Accepts either:
+      - legacy: [ {id, payload, ...}, ... ]
+      - new: {"ok":true,"commands":[{id,ts,payload},...]}
+    Returns list of command dicts.
+    """
+    try:
+        j = r.json()
+    except Exception:
+        return []
+    if isinstance(j, list):
+        return j
+    if isinstance(j, dict) and isinstance(j.get("commands"), list):
+        return j["commands"]
+    return []
 
+def pull_once(limit=10):
+    url  = CLOUD_BASE_URL.rstrip("/") + "/api/commands/pull"
+    body = {"agent_id": AGENT_ID, "limit": limit}
+    r = _post_signed(url, body, timeout=20)
+    if r.status_code >= 400:
+        raise requests.HTTPError(f"{r.status_code} {r.text[:200]}", response=r)
+    return _parse_pull_response(r)
+
+# --- Idempotency cache for recent command IDs --------------------------------
+RECENT_IDS = collections.deque(maxlen=256)
+def _seen_before(cid):
+    s = str(cid)
+    if s in RECENT_IDS:
+        return True
+    RECENT_IDS.append(s)
+    return False
+
+# --- Main --------------------------------------------------------------------
 def main():
     _log(f"online — mode={EDGE_MODE} hold={EDGE_HOLD} base={CLOUD_BASE_URL} agent={AGENT_ID}")
     backoff = 2
     while True:
         try:
-            cmds = pull_once()
+            if EDGE_HOLD:
+                time.sleep(EDGE_POLL_SECS)
+                continue
+
+            cmds = pull_once(limit=10)
             if cmds:
                 _log(f"pulled {len(cmds)} command(s)")
+
             for cmd in cmds:
                 cid = cmd.get("id")
+                if _seen_before(cid):
+                    _log(f"skip duplicate id {cid}")
+                    continue
+
                 try:
                     res = exec_command(cmd)
                 except Exception as e:
@@ -326,13 +367,13 @@ def main():
                     traceback.print_exc()
                     res = {"status": "error", "message": str(e), "fills": []}
 
-                ack_ok = False
                 try:
-                    ack_ok = ack_command(cid, res)
+                    ok = ack_command_new(cid, res)
                 except Exception as e:
                     _log(f"ack exception {cid}: {e}")
+                    ok = False
 
-                if ack_ok:
+                if ok:
                     try:
                         post_receipt(cmd, res)
                     except Exception as e:
