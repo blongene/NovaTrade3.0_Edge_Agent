@@ -347,6 +347,7 @@ def _printable_balances(bals: dict, wanted: tuple[str, ...], kraken_alias: bool 
     return out
     
 def maybe_balance_snapshot():
+    """Periodic balance snapshot for telemetry — lean, safe, and quiet."""
     global _last_bal_snap
     if not telemetry_db:
         return
@@ -354,31 +355,42 @@ def maybe_balance_snapshot():
     if now - _last_bal_snap < BALANCE_SNAPSHOT_SECS:
         return
     _last_bal_snap = now
-    # Coinbase
+
+    def _capture(label, bals):
+        """Small helper to push to telemetry and print clean snapshot."""
+        try:
+            if not isinstance(bals, dict):
+                return
+            telemetry_db.upsert_balances(label, bals)
+            wanted = ("USDT", "USDC", "BTC", "XBT")
+            view = _printable_balances(bals, tuple(wanted), kraken_alias=(label == "KRAKEN"))
+            if view:
+                _log(f"snapshot {label} balances: {view}")
+        except Exception as e:
+            _log(f"snapshot {label} error during capture: {e}")
+
+    # --- Coinbase ---
     try:
         cb = CoinbaseCDP()
-        bals = cb.balances()
-        telemetry_db.upsert_balances("COINBASE", bals)
-        cb_view = _printable_balances(bals_cb, ("USDC", "BTC"))
-        _log(f"snapshot COINBASE balances: {cb_view}")
+        bals_cb = cb.balances()
+        _capture("COINBASE", bals_cb)
     except Exception as e:
         _log(f"snapshot COINBASE error: {e}")
-    # Binance.US
+
+    # --- Binance.US ---
     try:
         bus = BinanceUS()
         acct = bus.account()
-        bals = { (b.get('asset') or '').upper(): float(b.get('free') or 0.0) for b in (acct.get('balances') or []) }
-        telemetry_db.upsert_balances("BINANCEUS", bals)
-        bus_view = _printable_balances(bals_bus, ("USDT", "BTC"))
-        _log(f"snapshot BINANCEUS balances: {bus_view}")
+        bals_bus = { (b.get('asset') or '').upper(): float(b.get('free') or 0.0)
+                     for b in (acct.get('balances') or []) }
+        _capture("BINANCEUS", bals_bus)
     except Exception as e:
         _log(f"snapshot BINANCEUS error: {e}")
-    # Kraken
+
+    # --- Kraken ---
     try:
-        bals = kraken_balance()
-        telemetry_db.upsert_balances("KRAKEN", bals)
-        kr_view = _printable_balances(bals_kr, ("USDT", "BTC"), kraken_alias=True)
-        _log(f"snapshot KRAKEN balances: {kr_view}")
+        bals_kr = kraken_balance()
+        _capture("KRAKEN", bals_kr)
     except Exception as e:
         _log(f"snapshot KRAKEN error: {e}")
 
