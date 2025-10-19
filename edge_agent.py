@@ -29,7 +29,7 @@ CLOUD_BASE_URL = os.getenv("CLOUD_BASE_URL") or os.getenv("BASE_URL") or "http:/
 AGENT_ID       = (os.getenv("AGENT_ID") or os.getenv("EDGE_AGENT_ID") or "edge-local").split(",")[0].strip()
 EDGE_MODE      = (os.getenv("EDGE_MODE") or "dryrun").strip().lower()   # dryrun | live
 EDGE_HOLD      = (os.getenv("EDGE_HOLD") or "false").strip().lower() in {"1","true","yes"}
-EDGE_SECRET    = (os.getenv("EDGE_SECRET") or "").strip()
+EDGE_SECRET    = (os.getenv("EDGE_SECRET") or os.getenv("OUTBOX_SECRET") or "").strip()
 EDGE_POLL_SECS = int(os.getenv("EDGE_POLL_SECS") or "10")
 
 # Heartbeat / telemetry cadence
@@ -69,14 +69,13 @@ def _canon(d: dict) -> bytes:
 def _hmac_hex(secret: str, raw_bytes: bytes) -> str:
     return hmac.new(secret.encode("utf-8"), raw_bytes, hashlib.sha256).hexdigest()
 
-def _post_signed(url: str, body: dict, timeout=20):
-    raw = _canon(body)
-    ts  = str(int(time.time() * 1000))
+def post_signed(url: str, body: dict, timeout=15):
+    raw = json.dumps(body, separators=(",", ":"), sort_keys=False).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if EDGE_SECRET:
-        headers["X-Signature"] = _hmac_hex(EDGE_SECRET, raw)
-        headers["X-Timestamp"] = ts
-    return SESSION.post(url, data=raw, headers=headers, timeout=timeout)
+        sig = hmac.new(EDGE_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+        headers["X-Outbox-Signature"] = f"sha256={sig}"
+    return requests.post(url, data=raw, headers=headers, timeout=timeout)
 
 def _post_signed_retry(url: str, body: dict, timeout=20, retries=3):
     for attempt in range(retries):
@@ -174,22 +173,20 @@ def ack_command_new(cmd_id: int, exec_result: dict):
     Signed with X-Signature/X-Timestamp if EDGE_SECRET is set.
     """
     status = "DONE" if exec_result.get("status") in {"ok","held"} else "ERROR"
-    body = {
-        "id": cmd_id,
-        "status": status,
+    ack_body = {
+        "id": cmd_id,                 # the id returned by /api/commands/pull
+        "status": "DONE",             # or "ERROR"/"HELD"
         "receipt": {
-            "agent_id": AGENT_ID,
-            "status": exec_result.get("status"),
-            "txid": exec_result.get("txid"),
-            "fills": exec_result.get("fills", []),
-            "message": exec_result.get("message"),
-            "venue": exec_result.get("venue"),
-            "symbol": exec_result.get("symbol"),
-            "side": exec_result.get("side"),
-            "result": exec_result,
+            "venue": venue,
+            "symbol": symbol,
+            "side": side,
+            "amount_quote": amount_quote,   # whatever you executed
+            "txid": txid_or_empty,
             "ts": int(time.time())
         }
     }
+    resp = post_signed(f"{BASE_URL}/api/commands/ack", ack_body)
+    print("[edge] ack", cmd_id, resp.status_code, resp.text)
     url = CLOUD_BASE_URL.rstrip("/") + "/api/commands/ack"
     r = _post_signed_retry(url, body, timeout=20, retries=3)
     if r.status_code >= 400:
