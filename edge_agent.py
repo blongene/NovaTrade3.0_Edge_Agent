@@ -74,22 +74,21 @@ def _hmac_hex(secret: str, raw_bytes: bytes) -> str:
 
 def _post_signed(url: str, body: dict, timeout=20):
     raw = json.dumps(body, separators=(",", ":"), sort_keys=False).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "User-Agent": "NovaTrade-Edge/1.5"}
     if EDGE_SECRET:
         sig = hmac.new(EDGE_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
         headers["X-Outbox-Signature"] = f"sha256={sig}"
-    return SESSION.post(url, data=raw, headers=headers, timeout=timeout)
+    return requests.post(url, data=raw, headers=headers, timeout=timeout)
 
 def _post_signed_retry(url: str, body: dict, timeout=20, retries=3):
-    for attempt in range(retries):
+    for i in range(retries):
         try:
             r = _post_signed(url, body, timeout=timeout)
             if r.status_code < 500:
                 return r
-            _log(f"POST retry {attempt+1}/{retries} on {url}: {r.status_code}")
-        except Exception as e:
-            _log(f"POST exception {attempt+1}/{retries} on {url}: {e}")
-        time.sleep(2 * (attempt + 1))
+        except Exception:
+            pass
+        time.sleep(2 * (i + 1))
     return _post_signed(url, body, timeout=timeout)
 
 def _venue_key(v: str) -> str:
@@ -211,19 +210,46 @@ def _build_receipt(cmd: dict, exec_result: dict) -> dict:
     }
 
 def ack_command_new(cmd: dict, exec_result: dict) -> bool:
+    """Sends DONE/ERROR/HELD to Bus + receipt payload."""
     cmd_id = cmd.get("id")
-    ack_body = {
+
+    # Build receipt: prefer executor fields; fall back to original payload
+    p = cmd.get("payload") or {}
+    venue  = (exec_result.get("venue")  or p.get("venue")  or "").upper()
+    symbol =  exec_result.get("symbol") or p.get("symbol") or p.get("product_id") or ""
+    side   = (exec_result.get("side")   or p.get("side")   or "").upper()
+
+    # Quote/base amounts (normalize)
+    amount_quote = float(p.get("amount_quote") or p.get("amount_usd") or p.get("quote_amount") or p.get("amount") or 0.0)
+    amount_base  = float(p.get("base_amount") or 0.0)
+
+    status = (exec_result.get("status") or "").lower()
+    ack_status = "DONE" if status == "ok" else ("HELD" if status == "held" else "ERROR")
+
+    body = {
         "id": cmd_id,
-        "status": _status_to_ack(exec_result),    # DONE | ERROR | HELD
-        "receipt": _build_receipt(cmd, exec_result)
+        "status": ack_status,              # DONE | ERROR | HELD
+        "receipt": {
+            "venue": venue,
+            "symbol": symbol,
+            "side": side,
+            "amount_quote": amount_quote,
+            "amount_base": amount_base,
+            "txid": exec_result.get("txid", ""),
+            "fills": exec_result.get("fills", []),
+            "executed_qty": exec_result.get("executed_qty"),
+            "avg_price": exec_result.get("avg_price"),
+            "ts": int(time.time()),
+            "agent": os.getenv("EDGE_AGENT_ID","edge-primary"),
+            "mode": os.getenv("EDGE_MODE","live"),
+            "note": exec_result.get("message",""),
+        },
     }
-    url = f"{CLOUD_BASE_URL}/api/commands/ack"
-    r = _post_signed_retry(url, ack_body, timeout=20, retries=3)
-    if r.status_code >= 400:
-        _log(f"ack NEW failed {cmd_id}: {r.status_code} {r.text[:160]}")
-        return False
-    _log(f"ack NEW ok {cmd_id}: {r.status_code}")
-    return True
+
+    url = f"{BASE_URL.rstrip('/')}/api/commands/ack"
+    r = _post_signed_retry(url, body, timeout=20, retries=3)
+    print(f"[edge] ack {cmd_id} {r.status_code} {r.text[:160]}")
+    return r.ok
 
 # --- Receipts: post to /api/receipts/ack (optional mirror) -------------------
 def post_receipt(cmd: dict, exec_result: dict):
