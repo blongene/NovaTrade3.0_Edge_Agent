@@ -29,6 +29,7 @@ except Exception:
 
 # --- Env ---------------------------------------------------------------------
 CLOUD_BASE_URL = (os.getenv("CLOUD_BASE_URL") or os.getenv("BASE_URL") or "http://localhost:10000").rstrip("/")
+BASE_URL = CLOUD_BASE_URL
 AGENT_ID       = (os.getenv("AGENT_ID") or os.getenv("EDGE_AGENT_ID") or "edge-local").split(",")[0].strip()
 EDGE_MODE      = (os.getenv("EDGE_MODE") or "dryrun").strip().lower()   # dryrun | live
 EDGE_HOLD      = (os.getenv("EDGE_HOLD") or "false").strip().lower() in {"1","true","yes"}
