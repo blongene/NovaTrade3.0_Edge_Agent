@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-# edge_agent.py — NovaTrade Edge Agent (Phase 5)
-# - Polls commands from Bus, executes locally, ACKs with HMAC, posts receipts
-# - Works with both legacy pull format (list) and new format {"ok":true,"commands":[...]}
+# edge_agent.py — NovaTrade Edge Agent (Phase 5, consolidated)
+# - Polls commands from Bus (/api/commands/pull)
+# - Executes via venue executors (Coinbase Adv, BinanceUS, Kraken)
+# - ACKs with HMAC header to /api/commands/ack (DONE/ERROR/HELD)
+# - Optionally mirrors receipts to /api/receipts/ack
+# - Telemetry heartbeat + optional balance snapshots
 
 import os, time, json, hmac, hashlib, requests, sys, traceback, re, collections
 
@@ -25,7 +28,7 @@ except Exception:
     telemetry_sync = None
 
 # --- Env ---------------------------------------------------------------------
-CLOUD_BASE_URL = os.getenv("CLOUD_BASE_URL") or os.getenv("BASE_URL") or "http://localhost:10000"
+CLOUD_BASE_URL = (os.getenv("CLOUD_BASE_URL") or os.getenv("BASE_URL") or "http://localhost:10000").rstrip("/")
 AGENT_ID       = (os.getenv("AGENT_ID") or os.getenv("EDGE_AGENT_ID") or "edge-local").split(",")[0].strip()
 EDGE_MODE      = (os.getenv("EDGE_MODE") or "dryrun").strip().lower()   # dryrun | live
 EDGE_HOLD      = (os.getenv("EDGE_HOLD") or "false").strip().lower() in {"1","true","yes"}
@@ -35,11 +38,11 @@ EDGE_POLL_SECS = int(os.getenv("EDGE_POLL_SECS") or "10")
 # Heartbeat / telemetry cadence
 HEARTBEAT_SECS = int(os.getenv("HEARTBEAT_SECS") or os.getenv("HEARTBEAT_EVERY_S") or "900")  # default 15m
 BALANCE_SNAPSHOT_SECS = int(os.getenv("BALANCE_SNAPSHOT_SECS", "7200"))  # every 2h
-TELEMETRY_VERBOSE = (os.getenv("TELEMETRY_VERBOSE") or "0").strip() in {"1","true","yes"}
+TELEMETRY_VERBOSE = (os.getenv("TELEMETRY_VERBOSE") or "0").strip().lower() in {"1","true","yes"}
 
 # --- HTTP session with retry -------------------------------------------------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "NovaTrade-Edge/1.4"})
+SESSION.headers.update({"User-Agent": "NovaTrade-Edge/1.5"})
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 _retry = Retry(total=3, connect=3, read=3, backoff_factor=0.5,
@@ -63,19 +66,19 @@ def _log(msg: str):
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
     print(f"[edge] {ts} {msg}", flush=True)
 
-def _canon(d: dict) -> bytes:
-    return json.dumps(d, separators=(",", ":"), sort_keys=True).encode("utf-8")
+def _canon(d: dict, sort_keys=True) -> bytes:
+    return json.dumps(d, separators=(",", ":"), sort_keys=sort_keys).encode("utf-8")
 
 def _hmac_hex(secret: str, raw_bytes: bytes) -> str:
     return hmac.new(secret.encode("utf-8"), raw_bytes, hashlib.sha256).hexdigest()
 
-def post_signed(url: str, body: dict, timeout=15):
+def _post_signed(url: str, body: dict, timeout=20):
     raw = json.dumps(body, separators=(",", ":"), sort_keys=False).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if EDGE_SECRET:
         sig = hmac.new(EDGE_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
         headers["X-Outbox-Signature"] = f"sha256={sig}"
-    return requests.post(url, data=raw, headers=headers, timeout=timeout)
+    return SESSION.post(url, data=raw, headers=headers, timeout=timeout)
 
 def _post_signed_retry(url: str, body: dict, timeout=20, retries=3):
     for attempt in range(retries):
@@ -95,10 +98,9 @@ def _venue_key(v: str) -> str:
 # --- Normalize command payload ----------------------------------------------
 def _normalize_payload(p: dict):
     """
-    Make sense of different payload variants:
-      - amount_usd (quote)
-      - amount / quote_amount (quote)
-      - base_amount (base)
+    Normalize different payload variants:
+      - quote amount fields: amount_quote, amount_usd, quote_amount, amount
+      - base amount field: base_amount
     Returns tuple: (venue_key, side, symbol, amount_quote, amount_base)
     """
     venue_key = _venue_key(p.get("venue"))
@@ -107,7 +109,7 @@ def _normalize_payload(p: dict):
 
     # quote amount (USD/USDT/USDC)
     amount_quote = None
-    for k in ("amount_usd", "quote_amount", "amount"):
+    for k in ("amount_quote", "amount_usd", "quote_amount", "amount"):
         if p.get(k) is not None:
             try:
                 amount_quote = float(p.get(k))
@@ -133,21 +135,29 @@ def exec_command(cmd: dict) -> dict:
     venue_key, side, symbol, amount_quote, amount_base = _normalize_payload(p)
 
     if EDGE_HOLD:
-        return {"status":"held","message":"EDGE_HOLD enabled","fills":[]}
+        return {"status":"held","message":"EDGE_HOLD enabled","fills":[], "venue":venue_key, "symbol":symbol, "side":side}
 
     # Guardrails
     if side == "BUY" and amount_quote <= 0:
-        return {"status":"error","message":"BUY requires amount_quote > 0","fills":[]}
+        return {"status":"error","message":"BUY requires amount_quote > 0","fills":[],"venue":venue_key,"symbol":symbol,"side":side}
     if side == "SELL" and amount_base <= 0:
-        return {"status":"error","message":"SELL requires amount_base > 0","fills":[]}
+        return {"status":"error","message":"SELL requires amount_base > 0","fills":[],"venue":venue_key,"symbol":symbol,"side":side}
 
     # Live executors
     if venue_key in EXECUTORS:
-        return EXECUTORS[venue_key](
-            venue_symbol=symbol, side=side,
-            amount_quote=amount_quote, amount_base=amount_base,
-            client_id=str(cmd.get("id")), edge_mode=EDGE_MODE, edge_hold=EDGE_HOLD
-        )
+        try:
+            res = EXECUTORS[venue_key](
+                venue_symbol=symbol, side=side,
+                amount_quote=amount_quote, amount_base=amount_base,
+                client_id=str(cmd.get("id")), edge_mode=EDGE_MODE, edge_hold=EDGE_HOLD
+            )
+        except Exception as e:
+            return {"status":"error","message":str(e),"fills":[],"venue":venue_key,"symbol":symbol,"side":side}
+        # Ensure venue/symbol/side present in result for downstream
+        res.setdefault("venue", venue_key)
+        res.setdefault("symbol", symbol)
+        res.setdefault("side", side)
+        return res
 
     # Fallback in dryrun
     if EDGE_MODE != "live":
@@ -163,44 +173,63 @@ def exec_command(cmd: dict) -> dict:
             "executed_qty":qty,
             "avg_price":px
         }
-    return {"status":"error","message": f"live mode venue not implemented: {venue_key}", "fills":[]}
+    return {"status":"error","message": f"live mode venue not implemented: {venue_key}", "fills":[], "venue":venue_key, "symbol":symbol, "side":side}
 
 # --- ACK (new Bus format) ----------------------------------------------------
-def ack_command_new(cmd_id: int, exec_result: dict):
-    """
-    New Bus ack: POST /api/commands/ack with body:
-      { "id": <int>, "status": "DONE"|"ERROR"|"HELD", "receipt": {...} }
-    Signed with X-Signature/X-Timestamp if EDGE_SECRET is set.
-    """
-    status = "DONE" if exec_result.get("status") in {"ok","held"} else "ERROR"
-    ack_body = {
-        "id": cmd_id,                 # the id returned by /api/commands/pull
-        "status": "DONE",             # or "ERROR"/"HELD"
-        "receipt": {
-            "venue": venue,
-            "symbol": symbol,
-            "side": side,
-            "amount_quote": amount_quote,   # whatever you executed
-            "txid": txid_or_empty,
-            "ts": int(time.time())
-        }
+def _status_to_ack(exec_result: dict) -> str:
+    st = (exec_result.get("status") or "").lower()
+    if st == "held":
+        return "HELD"
+    if st == "ok":
+        return "DONE"
+    return "ERROR"
+
+def _build_receipt(cmd: dict, exec_result: dict) -> dict:
+    p = cmd.get("payload") or {}
+    # Prefer values from execution result; fall back to command payload
+    venue  = (exec_result.get("venue")  or p.get("venue")  or "").upper()
+    symbol =  exec_result.get("symbol") or p.get("symbol") or p.get("product_id") or ""
+    side   = (exec_result.get("side")   or p.get("side")   or "").upper()
+
+    # Capture quote amount we intended
+    _, _, _, amount_quote, amount_base = _normalize_payload(p)
+
+    return {
+        "venue": venue,
+        "symbol": symbol,
+        "side": side,
+        "amount_quote": amount_quote,
+        "amount_base": amount_base,
+        "txid": exec_result.get("txid",""),
+        "fills": exec_result.get("fills", []),
+        "executed_qty": exec_result.get("executed_qty"),
+        "avg_price": exec_result.get("avg_price"),
+        "ts": int(time.time()),
+        "agent": AGENT_ID,
+        "mode": EDGE_MODE,
+        "note": exec_result.get("message","")
     }
-    resp = post_signed(f"{BASE_URL}/api/commands/ack", ack_body)
-    print("[edge] ack", cmd_id, resp.status_code, resp.text)
-    url = CLOUD_BASE_URL.rstrip("/") + "/api/commands/ack"
-    r = _post_signed_retry(url, body, timeout=20, retries=3)
+
+def ack_command_new(cmd: dict, exec_result: dict) -> bool:
+    cmd_id = cmd.get("id")
+    ack_body = {
+        "id": cmd_id,
+        "status": _status_to_ack(exec_result),    # DONE | ERROR | HELD
+        "receipt": _build_receipt(cmd, exec_result)
+    }
+    url = f"{CLOUD_BASE_URL}/api/commands/ack"
+    r = _post_signed_retry(url, ack_body, timeout=20, retries=3)
     if r.status_code >= 400:
         _log(f"ack NEW failed {cmd_id}: {r.status_code} {r.text[:160]}")
         return False
     _log(f"ack NEW ok {cmd_id}: {r.status_code}")
     return True
 
-# --- Receipts: post to /api/receipts/ack ------------------------------------
+# --- Receipts: post to /api/receipts/ack (optional mirror) -------------------
 def post_receipt(cmd: dict, exec_result: dict):
     if not EDGE_SECRET:
-        _log("WARN: EDGE_SECRET missing; skipping receipt post")
+        # HMAC not set? quietly skip optional receipt mirror
         return
-
     payload = {
         "id": cmd["id"],
         "agent_id": AGENT_ID,
@@ -217,10 +246,11 @@ def post_receipt(cmd: dict, exec_result: dict):
         "resolved_symbol":  exec_result.get("resolved_symbol") or exec_result.get("symbol"),
         "post_balances":    exec_result.get("post_balances"),
     }
+    # Header HMAC is already sent by _post_signed; in-payload HMAC is optional legacy
     canon = _canon({k: v for k, v in payload.items() if k != "hmac"})
     payload["hmac"] = _hmac_hex(EDGE_SECRET, canon)
 
-    url = CLOUD_BASE_URL.rstrip("/") + "/api/receipts/ack"
+    url = f"{CLOUD_BASE_URL}/api/receipts/ack"
     try:
         r = _post_signed_retry(url, payload, timeout=30, retries=3)
         _log(f"posted receipt {cmd['id']}: {r.status_code} {r.text[:160]}")
@@ -282,7 +312,7 @@ def maybe_balance_snapshot():
         cb = CoinbaseCDP()
         bals = cb.balances()
         telemetry_db.upsert_balances("COINBASE", bals)
-        _log(f"snapshot COINBASE balances: { {k: round(v,8) for k,v in bals.items() if k in ('USDC','BTC')} }")
+        _log(f"snapshot COINBASE balances: {{k: round(v,8) for k,v in bals.items() if k in ('USDC','BTC')}}")
     except Exception as e:
         _log(f"snapshot COINBASE error: {e}")
     # Binance.US
@@ -291,18 +321,18 @@ def maybe_balance_snapshot():
         acct = bus.account()
         bals = { (b.get('asset') or '').upper(): float(b.get('free') or 0.0) for b in (acct.get('balances') or []) }
         telemetry_db.upsert_balances("BINANCEUS", bals)
-        _log(f"snapshot BINANCEUS balances: { {k: round(v,8) for k,v in bals.items() if k in ('USDT','BTC')} }")
+        _log(f"snapshot BINANCEUS balances: {{k: round(v,8) for k,v in bals.items() if k in ('USDT','BTC')}}")
     except Exception as e:
         _log(f"snapshot BINANCEUS error: {e}")
     # Kraken
     try:
         bals = kraken_balance()
         telemetry_db.upsert_balances("KRAKEN", bals)
-        _log(f"snapshot KRAKEN balances: { {k: round(v,8) for k,v in bals.items() if k in ('USDT','XBT')} }")
+        _log(f"snapshot KRAKEN balances: {{k: round(v,8) for k,v in bals.items() if k in ('USDT','XBT')}}")
     except Exception as e:
         _log(f"snapshot KRAKEN error: {e}")
 
-# --- Pull loop (supports legacy & new) ---------------------------------------
+# --- Pull helpers ------------------------------------------------------------
 def _parse_pull_response(r):
     """
     Accepts either:
@@ -321,9 +351,9 @@ def _parse_pull_response(r):
     return []
 
 def pull_once(limit=10):
-    url  = CLOUD_BASE_URL.rstrip("/") + "/api/commands/pull"
+    url  = f"{CLOUD_BASE_URL}/api/commands/pull"
     body = {"agent_id": AGENT_ID, "limit": limit}
-    r = _post_signed(url, body, timeout=20)
+    r = _post_signed(url, body, timeout=20)   # signing pull is fine; Bus ignores if not required
     if r.status_code >= 400:
         raise requests.HTTPError(f"{r.status_code} {r.text[:200]}", response=r)
     return _parse_pull_response(r)
@@ -357,6 +387,7 @@ def main():
                     _log(f"skip duplicate id {cid}")
                     continue
 
+                # Execute
                 try:
                     res = exec_command(cmd)
                 except Exception as e:
@@ -364,12 +395,14 @@ def main():
                     traceback.print_exc()
                     res = {"status": "error", "message": str(e), "fills": []}
 
+                # ACK
+                ok = False
                 try:
-                    ok = ack_command_new(cid, res)
+                    ok = ack_command_new(cmd, res)
                 except Exception as e:
                     _log(f"ack exception {cid}: {e}")
-                    ok = False
 
+                # Optional receipt mirror (and telemetry)
                 if ok:
                     try:
                         post_receipt(cmd, res)
