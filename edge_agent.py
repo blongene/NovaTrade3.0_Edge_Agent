@@ -326,6 +326,26 @@ def maybe_telemetry_tick():
         except Exception as e:
             _log(f"telemetry push error: {e}")
 
+def _printable_balances(bals: dict, wanted: tuple[str, ...], kraken_alias: bool = False) -> dict:
+    # optionally normalize Kraken XBT→BTC for readability
+    out = {}
+    for k in wanted:
+        val = None
+        if kraken_alias and k == "BTC":
+            # accept both BTC and XBT keys for Kraken
+            val = bals.get("BTC", None)
+            if val is None:
+                val = bals.get("XBT", None)
+        else:
+            val = bals.get(k, None)
+        if val is not None:
+            try:
+                out[k] = round(float(val), 8)
+            except Exception:
+                # keep raw if it can’t be casted for some reason
+                out[k] = val
+    return out
+    
 def maybe_balance_snapshot():
     global _last_bal_snap
     if not telemetry_db:
@@ -339,7 +359,8 @@ def maybe_balance_snapshot():
         cb = CoinbaseCDP()
         bals = cb.balances()
         telemetry_db.upsert_balances("COINBASE", bals)
-        _log(f"snapshot COINBASE balances: {{k: round(v,8) for k,v in bals.items() if k in ('USDC','BTC')}}")
+        cb_view = _printable_balances(bals_cb, ("USDC", "BTC"))
+        _log(f"snapshot COINBASE balances: {cb_view}")
     except Exception as e:
         _log(f"snapshot COINBASE error: {e}")
     # Binance.US
@@ -348,14 +369,16 @@ def maybe_balance_snapshot():
         acct = bus.account()
         bals = { (b.get('asset') or '').upper(): float(b.get('free') or 0.0) for b in (acct.get('balances') or []) }
         telemetry_db.upsert_balances("BINANCEUS", bals)
-        _log(f"snapshot BINANCEUS balances: {{k: round(v,8) for k,v in bals.items() if k in ('USDT','BTC')}}")
+        bus_view = _printable_balances(bals_bus, ("USDT", "BTC"))
+        _log(f"snapshot BINANCEUS balances: {bus_view}")
     except Exception as e:
         _log(f"snapshot BINANCEUS error: {e}")
     # Kraken
     try:
         bals = kraken_balance()
         telemetry_db.upsert_balances("KRAKEN", bals)
-        _log(f"snapshot KRAKEN balances: {{k: round(v,8) for k,v in bals.items() if k in ('USDT','XBT')}}")
+        kr_view = _printable_balances(bals_kr, ("USDT", "BTC"), kraken_alias=True)
+        _log(f"snapshot KRAKEN balances: {kr_view}")
     except Exception as e:
         _log(f"snapshot KRAKEN error: {e}")
 
