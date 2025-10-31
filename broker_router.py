@@ -47,6 +47,16 @@ def execute(cmd: Dict[str, Any]) -> Dict[str, Any]:
         from kraken_executor import execute as kraken_exec
         return _as_ok(kraken_exec(cmd))
 
-    # ---- Default → MEXC (kept for compatibility) ----
-    from mexc_executor import _execute_mexc as mexc_exec
-    return _as_ok(mexc_exec(cmd))
+# ---- MEXC ----
+    if venue == "MEXC":
+        from executors.mexc_executor import place_market_order as mexc_exec
+        client_order_id = payload.get("client_order_id") or f"EDGE-{int(time.time()*1000)}"
+        rec = mexc_exec(
+            client_order_id=client_order_id,
+            symbol=symbol,
+            side=side,
+            amount=str(quote)
+        )
+        return _as_ok(rec)
+
+    return {"status": "error", "message": f"unknown venue: {venue}", "fills": []}

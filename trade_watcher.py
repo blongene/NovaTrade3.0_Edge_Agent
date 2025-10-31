@@ -2,7 +2,7 @@ import os, json, time
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from config import SHEET_URL, CREDS_FILE, DEFAULT_BUY_USDT, MIN_USDT_ORDER
-from mexc_executor import execute_buy, execute_sell
+from executors.mexc_executor import execute_buy, execute_sell
 
 def _gclient():
     scope = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']

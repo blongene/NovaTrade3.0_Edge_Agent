@@ -97,3 +97,31 @@ def place_market_order(*, client_order_id: str, symbol: str, side: str, amount: 
     receipt = {"status":"ok","txid":txid,"fills":fills,"message":f"filled (market {side}) {symbol} via MEXC"}
     remember_acked(client_order_id, receipt)
     return receipt
+
+def get_account_info():
+    return _r("GET", "/api/v3/account", signed=True)
+
+def execute_buy(token_symbol, usdt_amount):
+    return place_market_order(
+        client_order_id=f"buy-{token_symbol}-{usdt_amount}-{_ts_ms()}",
+        symbol=f"{token_symbol.upper()}USDT",
+        side="BUY",
+        amount=str(usdt_amount)
+    )
+
+def execute_sell(token_symbol):
+    acct = get_account_info()
+    balances = acct.get("balances", [])
+    token_balance = 0
+    for b in balances:
+        if b.get("asset") == token_symbol.upper():
+            token_balance = float(b.get("free", 0))
+            break
+    if token_balance > 0:
+        return place_market_order(
+            client_order_id=f"sell-{token_symbol}-{_ts_ms()}",
+            symbol=f"{token_symbol.upper()}USDT",
+            side="SELL",
+            amount=str(token_balance)
+        )
+    return None
