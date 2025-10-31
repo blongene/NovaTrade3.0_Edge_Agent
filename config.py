@@ -6,7 +6,7 @@ load_dotenv(dotenv_path=os.path.join(os.getcwd(), ".env"))
 SHEET_URL = os.getenv("SHEET_URL","").strip()
 CREDS_FILE = os.getenv("GOOGLE_CREDS_FILE","sentiment-log-service.json").strip()
 
-EXCHANGE = os.getenv("EXCHANGE","MEXC").upper()
+EXCHANGE = os.getenv("EXCHANGE","COINBASE").upper()
 MEXC_API_KEY = os.getenv("MEXC_API_KEY","").strip()
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET","").strip()
 
