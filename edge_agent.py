@@ -322,35 +322,62 @@ def handle_swap(cmd: dict, pnorm: dict) -> dict:
 
     # Try direct then bridges
     paths = _direct_or_bridge_paths(venue, from_asset, to_quote)
-    remaining_q = want_q
     all_fills = []
+
     for hop_idx, path in enumerate(paths):
         try:
-            tmp_remaining = remaining_q
-            tmp_fills = []
-            # simulate/execute each hop
-            for (base, quote) in path:
-                # For SWAP we SELL base to receive quote; executors often expect base amount (amount_base)
-                qty_base = _estimate_base_qty(venue, base, quote, tmp_remaining)
+            # --- Path 1: Direct SELL ---
+            if len(path) == 1:
+                (base, quote) = path[0]
+                if base != from_asset or quote != to_quote: continue
+
+                qty_base = _estimate_base_qty(venue, base, quote, want_q)
                 res = execute_market(venue, base, quote, side="SELL", amount_base=qty_base, amount_quote=0.0, client_id=cmd.get("id"))
-                # infer received quote from fills
-                fills = res.get("fills") or []
-                if fills:
-                    got_q = sum(float(f.get("qty") or 0.0) * float(f.get("price") or 0.0) for f in fills)  # approx quote value
-                else:
-                    # fallback: qty * price from avg
-                    got_q = float(res.get("executed_qty") or 0.0) * float(res.get("avg_price") or 0.0)
-                tmp_remaining = max(0.0, tmp_remaining - got_q)
-                tmp_fills.extend(fills or [])
-            # If we reached here without exception, accept this path
-            all_fills.extend(tmp_fills)
-            remaining_q = tmp_remaining
-            symbol_final = resolve_symbol(venue, from_asset, to_quote)
-            status = "ok" if EDGE_MODE != "live" or remaining_q <= want_q * 0.15 else "ok"  # relaxed in dryrun; real fills may be partial
-            return {"status":status,"message":f"SWAP path {hop_idx+1} hops={len(path)} rem_quote={remaining_q:.2f}","fills":all_fills,"venue":venue,"symbol":symbol_final,"side":"SELL"}
+
+                if (res.get("status") or "") != "ok":
+                    raise RuntimeError(f"Direct path execution failed: {res.get('message', 'unknown error')}")
+
+                # Merge executor result with standard SWAP response fields
+                out = res.copy()
+                out.update({"status":"ok", "message": f"SWAP direct path executed", "fills": res.get("fills", [])})
+                return out
+
+            # --- Path 2: Two-hop bridge SELL -> SELL ---
+            elif len(path) == 2:
+                (base1, quote1), (base2, quote2) = path
+                bridge_asset = quote1
+                if quote1 != base2: continue
+
+                # Estimate how much bridge asset we need, then how much from_asset to sell to get it
+                qty_bridge_needed = _estimate_base_qty(venue, base2, quote2, want_q)
+                qty_from_asset_to_sell = _estimate_base_qty(venue, base1, quote1, qty_bridge_needed)
+
+                # --- EXECUTION ---
+                # Leg 1: Sell from_asset for bridge_asset
+                res1 = execute_market(venue, base1, quote1, side="SELL", amount_base=qty_from_asset_to_sell, amount_quote=0.0, client_id=cmd.get("id"))
+                if (res1.get("status") or "") != "ok":
+                    raise RuntimeError(f"Bridge leg 1 ({base1}->{quote1}) failed: {res1.get('message', 'unknown error')}")
+
+                # Determine actual amount of bridge asset received
+                received_bridge_qty = float(res1.get("executed_qty", 0.0)) * float(res1.get("avg_price", 0.0))
+                if received_bridge_qty <= 0:
+                     raise RuntimeError(f"Bridge leg 1 resulted in zero {bridge_asset}")
+                all_fills.extend(res1.get("fills", []))
+
+                # Leg 2: Sell the received bridge_asset for the final to_quote asset
+                res2 = execute_market(venue, base2, quote2, side="SELL", amount_base=received_bridge_qty, amount_quote=0.0, client_id=cmd.get("id"))
+                if (res2.get("status") or "") != "ok":
+                    raise RuntimeError(f"Bridge leg 2 ({base2}->{quote2}) failed: {res2.get('message', 'unknown error')}")
+                all_fills.extend(res2.get("fills", []))
+
+                # Success
+                symbol_final = resolve_symbol(venue, from_asset, to_quote)
+                return {"status":"ok", "message": f"SWAP bridge via {bridge_asset} ok", "fills": all_fills, "venue": venue, "symbol": symbol_final, "side": "SELL"}
+
+            # else: paths with <1 or >2 hops are not supported by this logic
         except Exception as e:
-            # try next path
             _log(f"SWAP path failed {venue} {path}: {e}")
+            all_fills = [] # Reset for next path attempt
             continue
     return {"status":"error","message":"SWAP failed: no viable path","fills":[]}
 
