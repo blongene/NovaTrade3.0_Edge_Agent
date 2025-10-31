@@ -673,3 +673,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+from edge_bus_poller import start_bus_poller
+start_bus_poller()
+# … your existing balance push loop continues as-is
