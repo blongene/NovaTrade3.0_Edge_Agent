@@ -2,7 +2,8 @@ import os, json, time
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from config import SHEET_URL, CREDS_FILE, DEFAULT_BUY_USDT, MIN_USDT_ORDER
-from executors.mexc_executor import execute_buy, execute_sell
+from broker_router import execute
+from config import EXCHANGE
 
 def _gclient():
     scope = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
@@ -45,13 +46,18 @@ def run_once():
         if "stall" in source or "manual" in source or "telegram" in source or "sell" in source:
             action = "SELL"
 
-        if action=="BUY":
-            res = execute_buy(token, DEFAULT_BUY_USDT)
-        else:
-            res = execute_sell(token)
+        cmd = {
+            "payload": {
+                "venue": EXCHANGE,
+                "symbol": f"{token}/USDT",
+                "side": action,
+                "amount": DEFAULT_BUY_USDT if action == "BUY" else 0
+            }
+        }
+        res = execute(cmd)
 
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        if res:
+        if res and res.get("status") == "ok":
             # log
             log_ws.append_row([ts, token, action, res.get("qty",""), res.get("price",""), res.get("usdt_value",""), "OK"], value_input_option="RAW")
             # mark executed
