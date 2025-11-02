@@ -1,45 +1,30 @@
 #!/usr/bin/env python3
-# edge_agent.py — NovaTrade Edge Agent (patched to Bus Command Bus spec)
+# edge_agent.py — NovaTrade Edge Agent (Phase B ready)
 #
-# Roles:
-# - Poll commands from Bus (/api/commands/pull) with HMAC (X-NT-Sig)
-# - Execute intents on Coinbase Advanced, BinanceUS, Kraken
-# - Support BUY, SELL, and SWAP (with simple USDT/USDC bridge logic)
-# - ACK results to /api/commands/ack → {"agent_id","command_id","status","detail"}
-# - Heartbeat + periodic balance snapshots
-# - Telemetry: push balances to Bus (/api/telemetry/push) with optional HMAC
-#
-# Env (Edge):
-#   BASE_URL or CLOUD_BASE_URL=https://novatrade3-0.onrender.com
-#   AGENT_ID=edge-primary
-#   EDGE_MODE=live|dryrun
-#   EDGE_HOLD=false
-#   OUTBOX_SECRET=<shared HMAC with Bus>  # preferred
-#   EDGE_SECRET=<legacy name, used if OUTBOX_SECRET unset>
-#   TELEMETRY_SECRET=<optional; defaults to OUTBOX_SECRET/EDGE_SECRET>
-#   EDGE_POLL_SECS=8
-#   LEASE_SECONDS=120
-#   MAX_CMDS_PER_PULL=5
-#   HEARTBEAT_SECS=900
-#   BALANCE_SNAPSHOT_SECS=7200
-#   PUSH_BALANCES_ENABLED=1
-#   PUSH_BALANCES_EVERY_S=600
-#   TELEMETRY_VERBOSE=0
-#   WALLET_MONITOR_ENDPOINT=/api/telemetry/push   # default; aliases also work on Bus
+# - Polls /api/commands/pull (HMAC-signed)
+# - Executes intents on Coinbase Advanced, BinanceUS, Kraken
+# - Pre-trade guard (min qty / min notional / wallet check) + smart quote
+# - ACKs to /api/commands/ack (HMAC-signed) with durable detail
+# - Heartbeat + balance snapshots + balance telemetry push
 
-import os, time, json, hmac, hashlib, requests, re, traceback, collections
+import os, time, json, hmac, hashlib, requests, re, traceback, collections, pathlib
 from typing import Dict, Any
 
-# --- Venue executors ---------------------------------------------------------
+# =========================
+# Venue executors (yours)
+# =========================
 from executors.coinbase_advanced_executor import execute_market_order as cb_exec
-from executors.binance_us_executor import execute_market_order as bus_exec
-from executors.kraken_executor import execute_market_order as kr_exec
+from executors.binance_us_executor     import execute_market_order as bus_exec
+from executors.kraken_executor         import execute_market_order as kr_exec
+
 from executors.coinbase_advanced_executor import CoinbaseCDP
-from executors.binance_us_executor import BinanceUS
-from executors.kraken_executor import _balance as kraken_balance
+from executors.binance_us_executor     import BinanceUS
+from executors.kraken_executor         import _balance as kraken_balance
+
+# Pre-trade rules (we shipped this earlier)
 from edge_pretrade import pretrade_validate
 
-# --- Optional telemetry stores ----------------------------------------------
+# Optional local stores (best-effort)
 try:
     import telemetry_db
 except Exception:
@@ -49,69 +34,69 @@ try:
 except Exception:
     telemetry_sync = None
 
-# --- Env ---------------------------------------------------------------------
-BASE_URL = (os.getenv("CLOUD_BASE_URL") or os.getenv("BASE_URL") or "http://localhost:10000").rstrip("/")
-AGENT_ID = (os.getenv("AGENT_ID") or os.getenv("EDGE_AGENT_ID") or "edge-primary").split(",")[0].strip()
-EDGE_MODE = (os.getenv("EDGE_MODE") or "dryrun").strip().lower()      # dryrun | live
-EDGE_HOLD = (os.getenv("EDGE_HOLD") or "false").strip().lower() in {"1","true","yes"}
+# =========================
+# Environment
+# =========================
+BASE_URL   = (os.getenv("CLOUD_BASE_URL") or os.getenv("BASE_URL") or "http://localhost:10000").rstrip("/")
+AGENT_ID   = (os.getenv("AGENT_ID") or os.getenv("EDGE_AGENT_ID") or "edge-primary").split(",")[0].strip()
+EDGE_MODE  = (os.getenv("EDGE_MODE") or "dry").strip().lower()   # live | dry
+EDGE_HOLD  = (os.getenv("EDGE_HOLD") or "false").strip().lower() in {"1","true","yes"}
 
-OUTBOX_SECRET = (os.getenv("OUTBOX_SECRET") or os.getenv("EDGE_SECRET") or "").strip()
+OUTBOX_SECRET    = (os.getenv("OUTBOX_SECRET") or os.getenv("EDGE_SECRET") or os.getenv("BUS_SECRET") or "").strip()
 TELEMETRY_SECRET = (os.getenv("TELEMETRY_SECRET") or OUTBOX_SECRET).strip()
 
-EDGE_POLL_SECS = int(os.getenv("EDGE_POLL_SECS") or "8")
-LEASE_SECONDS = int(os.getenv("LEASE_SECONDS") or "120")
-MAX_PULL = int(os.getenv("MAX_CMDS_PER_PULL") or "5")
+EDGE_POLL_SECS   = int(os.getenv("EDGE_POLL_SECS") or "8")
+LEASE_SECONDS    = int(os.getenv("LEASE_SECONDS") or "120")
+MAX_PULL         = int(os.getenv("MAX_CMDS_PER_PULL") or "5")
 
-HEARTBEAT_SECS = int(os.getenv("HEARTBEAT_SECS") or os.getenv("HEARTBEAT_EVERY_S") or "900")
-BALANCE_SNAPSHOT_SECS = int(os.getenv("BALANCE_SNAPSHOT_SECS") or "7200")
+HEARTBEAT_SECS           = int(os.getenv("HEARTBEAT_SECS") or os.getenv("HEARTBEAT_EVERY_S") or "900")
+BALANCE_SNAPSHOT_SECS    = int(os.getenv("BALANCE_SNAPSHOT_SECS") or "7200")
+PUSH_BALANCES_ENABLED    = (os.getenv("PUSH_BALANCES_ENABLED") or "1").strip().lower() in {"1","true","yes"}
+PUSH_BALANCES_EVERY_S    = int(os.getenv("PUSH_BALANCES_EVERY_S") or "600")
+TELEMETRY_VERBOSE        = (os.getenv("TELEMETRY_VERBOSE") or "0").strip().lower() in {"1","true","yes"}
+WALLET_MONITOR_ENDPOINT  = (os.getenv("WALLET_MONITOR_ENDPOINT") or "/api/telemetry/push").strip()
 
-PUSH_BALANCES_ENABLED = (os.getenv("PUSH_BALANCES_ENABLED") or "1").strip().lower() in {"1","true","yes"}
-PUSH_BALANCES_EVERY_S = int(os.getenv("PUSH_BALANCES_EVERY_S") or "600")
-TELEMETRY_VERBOSE = (os.getenv("TELEMETRY_VERBOSE") or "0").strip().lower() in {"1","true","yes"}
-WALLET_MONITOR_ENDPOINT = (os.getenv("WALLET_MONITOR_ENDPOINT") or "/api/telemetry/push").strip()
-
-# --- HTTP session w/ retry ---------------------------------------------------
+# =========================
+# HTTP session with retry
+# =========================
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "NovaTrade-Edge/2.0"})
+SESSION.headers.update({"User-Agent": "NovaTrade-Edge/3.0"})
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 _retry = Retry(total=3, connect=3, read=3, backoff_factor=0.5,
-               status_forcelist=(429, 502, 503, 504),
-               allowed_methods=frozenset(["GET", "POST"]))
+               status_forcelist=(429,502,503,504),
+               allowed_methods=frozenset(["GET","POST"]))
 SESSION.mount("https://", HTTPAdapter(max_retries=_retry))
 SESSION.mount("http://",  HTTPAdapter(max_retries=_retry))
 
-# --- Logging -----------------------------------------------------------------
+# =========================
+# Logging helper
+# =========================
 def _log(msg: str):
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
     print(f"[edge] {ts} {msg}", flush=True)
 
-# --- HMAC helpers ------------------------------------------------------------
-def _canonical(body: Dict[str, Any]) -> bytes:
-    return json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
+# =========================
+# HMAC helpers + Bus POST
+# =========================
+def _canon(body: Dict[str, Any]) -> bytes:
+    return json.dumps(body, separators=(",",":"), sort_keys=True).encode("utf-8")
 
-def _sign(secret: str, body: Dict[str, Any]) -> str:
+def _sig(secret: str, body: Dict[str, Any]) -> str:
     if not secret:
         return ""
-    return hmac.new(secret.encode("utf-8"), _canonical(body), hashlib.sha256).hexdigest()
+    return hmac.new(secret.encode("utf-8"), _canon(body), hashlib.sha256).hexdigest()
 
-def _post_json(path: str, body: Dict[str, Any], secret: str = OUTBOX_SECRET, timeout=20) -> requests.Response:
-    headers = {"Content-Type": "application/json", "User-Agent": "NovaTrade-Edge/2.0"}
-    if secret:
-        headers["X-NT-Sig"] = _sign(secret, body)
+def bus_post(path: str, body: Dict[str, Any], secret: str = OUTBOX_SECRET, timeout=20) -> requests.Response:
     url = f"{BASE_URL}{path}"
+    headers = {"Content-Type": "application/json", "User-Agent": "NovaTrade-Edge/3.0"}
+    if secret:
+        headers["X-NT-Sig"] = _sig(secret, body)
     return SESSION.post(url, json=body, headers=headers, timeout=timeout)
 
-def _post_json_ok(path: str, body: Dict[str, Any], secret: str = OUTBOX_SECRET, timeout=20) -> Dict[str, Any]:
-    r = _post_json(path, body, secret=secret, timeout=timeout)
-    if r.status_code >= 400:
-        raise requests.HTTPError(f"{r.status_code} {r.text[:200]}", response=r)
-    try:
-        return r.json()
-    except Exception:
-        return {}
-
-# --- Executors registry ------------------------------------------------------
+# =========================
+# Executors registry + sym
+# =========================
 EXECUTORS = {
     "COINBASE":    cb_exec,
     "COINBASEADV": cb_exec,
@@ -121,7 +106,6 @@ EXECUTORS = {
     "KRAKEN":      kr_exec,
 }
 
-# --- Pair helpers ------------------------------------------------------------
 def _venue_key(v: str) -> str:
     return re.sub(r"[^A-Z]", "", (v or "").upper())
 
@@ -140,38 +124,14 @@ def _kr_sym(base: str, quote: str) -> str:
 
 def resolve_symbol(venue_key: str, base: str, quote: str) -> str:
     v = _venue_key(venue_key)
-    if v in ("COINBASE","COINBASEADV","CBADV"):
-        return _cb_prod(base, quote)
-    if v in ("BINANCEUS","BUSA"):
-        return _bus_sym(base, quote)
-    if v == "KRAKEN":
-        return _kr_sym(base, quote)
+    if v in ("COINBASE","COINBASEADV","CBADV"): return _cb_prod(base, quote)
+    if v in ("BINANCEUS","BUSA"):               return _bus_sym(base, quote)
+    if v == "KRAKEN":                            return _kr_sym(base, quote)
     return f"{base.upper()}-{quote.upper()}"
 
-def normalize_amounts_from_intent(intent: dict, price: float) -> dict:
-    """
-    Returns dict with amount_base and amount_quote consistent with intent.
-    Defaults: 'amount' is BASE units. If flags includes 'quote', 'amount' is QUOTE notional.
-    """
-    amt = float(intent.get("amount", 0) or 0)
-    flags = set([str(x).lower() for x in intent.get("flags", [])])
-
-    out = {"amount_base": 0.0, "amount_quote": 0.0}
-
-    if "quote" in flags:
-        # spend in QUOTE (e.g., dollars)
-        out["amount_quote"] = max(0.0, amt)
-        if price and price > 0:
-            out["amount_base"] = out["amount_quote"] / float(price)
-    else:
-        # default: amount is BASE units
-        out["amount_base"] = max(0.0, amt)
-        if price and price > 0:
-            out["amount_quote"] = out["amount_base"] * float(price)
-
-    return out
-
-# --- Public price fetchers ---------------------------------------------------
+# =========================
+# Price fetch (public)
+# =========================
 def fetch_price(venue_key: str, base: str, quote: str) -> float:
     v = _venue_key(venue_key)
     try:
@@ -194,7 +154,9 @@ def fetch_price(venue_key: str, base: str, quote: str) -> float:
         _log(f"price fetch failed {venue_key} {base}/{quote}: {e}")
     return float("nan")
 
-# --- Balances (for telemetry & snapshots) -----------------------------------
+# =========================
+# Balances for telemetry
+# =========================
 def get_balances() -> dict:
     out = {}
     try:
@@ -219,98 +181,95 @@ def maybe_push_balances():
     if not PUSH_BALANCES_ENABLED:
         return
     now = time.time()
-    if not hasattr(maybe_push_balances, "_last"):
-        maybe_push_balances._last = 0.0
-    if now - maybe_push_balances._last < max(60, PUSH_BALANCES_EVERY_S):
+    last = getattr(maybe_push_balances, "_last", 0.0)
+    if now - last < max(60, PUSH_BALANCES_EVERY_S):
         return
     maybe_push_balances._last = now
     try:
         payload = {"agent_id": AGENT_ID, "balances": get_balances()}
         secret = TELEMETRY_SECRET or OUTBOX_SECRET
-        r = _post_json(WALLET_MONITOR_ENDPOINT, payload, secret=secret, timeout=15)
+        r = bus_post(WALLET_MONITOR_ENDPOINT, payload, secret=secret, timeout=15)
         _log(f"push_balances {r.status_code} {r.text[:160]}")
     except Exception as e:
         _log(f"push_balances error: {e}")
 
-# --- Payload normalization ---------------------------------------------------
+# =========================
+# Amount normalization
+# =========================
+def normalize_amounts_from_intent(intent: dict, price: float) -> dict:
+    """
+    Returns amount_base and amount_quote, unambiguous.
+    Defaults: 'amount' means BASE units.
+    If flags contains 'quote', 'amount' is QUOTE notional.
+    """
+    amt = float(intent.get("amount", 0) or 0)
+    flags = set([str(x).lower() for x in intent.get("flags", [])])
+
+    out = {"amount_base": 0.0, "amount_quote": 0.0}
+    if "quote" in flags:
+        out["amount_quote"] = max(0.0, amt)
+        if price and price > 0:
+            out["amount_base"] = out["amount_quote"] / float(price)
+    else:
+        out["amount_base"] = max(0.0, amt)
+        if price and price > 0:
+            out["amount_quote"] = out["amount_base"] * float(price)
+    return out
+
+# =========================
+# Payload quick normalize
+# =========================
 def _normalize_payload(p: dict):
     venue_key = _venue_key(p.get("venue"))
-    action    = (p.get("action") or p.get("side") or "").upper()
     side      = (p.get("side") or "").upper()
     symbol    = p.get("symbol") or p.get("product_id") or ""
-
-    amount_quote = None
-    for k in ("amount_quote","amount_usd","quote_amount","amount"):
-        if p.get(k) is not None:
-            try:
-                amount_quote = float(p.get(k)); break
-            except Exception: pass
-    amount_quote = float(amount_quote or 0.0)
-
-    amount_base = 0.0
-    if p.get("base_amount") is not None:
-        try: amount_base = float(p.get("base_amount"))
-        except Exception: amount_base = 0.0
-
     return {
         "venue": venue_key,
-        "action": action,
-        "side": side,
+        "side":  side,
         "symbol": symbol,
-        "amount_quote": amount_quote,
-        "amount_base": amount_base,
-        "from": (p.get("from") or p.get("asset_from") or "").upper(),
-        "to": (p.get("to") or p.get("asset_to") or p.get("quote") or "").upper(),
-        "target_quote": (p.get("quote") or "").upper(),
-        "client_note": p.get("note") or "",
+        "from":  (p.get("from") or p.get("asset_from") or "").upper(),
+        "to":    (p.get("to") or p.get("asset_to") or p.get("quote") or "").upper(),
+        "flags": p.get("flags", []),
+        "note":  p.get("note") or "",
     }
 
-# --- SWAP helpers ------------------------------------------------------------
-def _direct_or_bridge_paths(venue: str, from_asset: str, to_quote: str):
-    from_a = (from_asset or "").upper(); to_q = (to_quote or "").upper()
-    if not from_a or not to_q:
-        return []
-    if from_a == to_q:
-        return [(from_a, to_q)]
+# =========================
+# SWAP (optional pathing)
+# =========================
+def _direct_or_bridge_paths(from_asset: str, to_quote: str):
+    fa = (from_asset or "").upper(); tq = (to_quote or "").upper()
+    if not fa or not tq: return []
+    if fa == tq: return [(fa, tq)]
     c = []
-    c.append([(from_a, to_q)])
-    if to_q != "USDT": c.append([(from_a, "USDT"), ("USDT", to_q)])
-    if to_q != "USDC": c.append([(from_a, "USDC"), ("USDC", to_q)])
-    if to_q in ("USDT","USDC"):
-        other = "USDC" if to_q == "USDT" else "USDT"
-        c.append([(from_a, other), (other, to_q)])
+    c.append([(fa, tq)])
+    if tq != "USDT": c.append([(fa, "USDT"), ("USDT", tq)])
+    if tq != "USDC": c.append([(fa, "USDC"), ("USDC", tq)])
+    if tq in ("USDT","USDC"):
+        other = "USDC" if tq == "USDT" else "USDT"
+        c.append([(fa, other), (other, tq)])
     return c
 
 def _estimate_base_qty(venue: str, base: str, quote: str, want_quote_amount: float) -> float:
     px = fetch_price(venue, base, quote)
-    if not (px and px == px and px > 0):
-        raise RuntimeError(f"no price for {venue} {base}/{quote}")
-    return (want_quote_amount / px) * 1.0025  # small safety factor
-
-# --- Execution ---------------------------------------------------------------
-def execute_market(venue_key: str, base: str, quote: str, side: str,
-                   amount_quote: float = 0.0, amount_base: float = 0.0, client_id: str = ""):
-    symbol = resolve_symbol(venue_key, base, quote)
-    exe = EXECUTORS.get(_venue_key(venue_key))
-    if not exe:
-        raise RuntimeError(f"executor missing for {venue_key}")
-    return exe(venue_symbol=symbol, side=side, amount_quote=amount_quote, amount_base=amount_base,
-               client_id=str(client_id), edge_mode=EDGE_MODE, edge_hold=EDGE_HOLD)
+    if not (px and px == px and px > 0.0):
+        raise RuntimeError(f"no price {venue} {base}/{quote}")
+    return (want_quote_amount / px) * 1.0025
 
 def handle_swap(cmd: dict, pnorm: dict) -> dict:
+    p = cmd.get("payload") or {}
     venue = pnorm["venue"]
     from_asset = pnorm["from"] or (pnorm["symbol"].split("-")[0] if pnorm["symbol"] else "")
-    to_quote   = pnorm["to"] or pnorm["target_quote"] or "USDT"
-    want_q     = max(0.0, float(pnorm["amount_quote"]))
+    to_quote   = pnorm["to"] or "USDT"
+    want_q     = float(p.get("amount") or p.get("amount_quote") or 0.0)
     if not (venue and from_asset and to_quote and want_q > 0):
-        return {"status":"error","message":"SWAP requires venue, from, to, amount_quote>0","fills":[]}
+        return {"status":"error","message":"SWAP requires venue, from, to, amount>0","fills":[]}
 
     if from_asset == to_quote:
-        return {"status":"ok","message":"SWAP no-op: from==to","fills":[],
+        return {"status":"ok","message":"SWAP no-op","fills":[],
                 "venue":venue,"symbol":resolve_symbol(venue, from_asset, to_quote),"side":"SELL",
                 "executed_qty":0.0,"avg_price":0.0}
 
-    paths = _direct_or_bridge_paths(venue, from_asset, to_quote)
+    paths = _direct_or_bridge_paths(from_asset, to_quote)
     all_fills = []
     for path in paths:
         try:
@@ -321,7 +280,7 @@ def handle_swap(cmd: dict, pnorm: dict) -> dict:
                 if (res.get("status") or "") != "ok":
                     raise RuntimeError(res.get("message","unknown error"))
                 out = res.copy()
-                out.update({"status":"ok","message":"SWAP direct path executed","fills":res.get("fills",[])})
+                out.update({"status":"ok","message":"SWAP direct executed","fills":res.get("fills",[])})
                 return out
             elif len(path) == 2:
                 (base1, quote1), (base2, quote2) = path
@@ -348,40 +307,66 @@ def handle_swap(cmd: dict, pnorm: dict) -> dict:
             continue
     return {"status":"error","message":"SWAP failed: no viable path","fills":[]}
 
+# =========================
+# Execution
+# =========================
+def execute_market(venue_key: str, base: str, quote: str, side: str,
+                   amount_quote: float = 0.0, amount_base: float = 0.0, client_id: str = ""):
+    symbol_for_exec = resolve_symbol(venue_key, base, quote)
+    exe = EXECUTORS.get(_venue_key(venue_key))
+    if not exe:
+        raise RuntimeError(f"executor missing for {venue_key}")
+    return exe(
+        venue_symbol=symbol_for_exec,
+        side=side,
+        amount_quote=amount_quote,
+        amount_base=amount_base,
+        client_id=str(client_id),
+        edge_mode=EDGE_MODE,
+        edge_hold=EDGE_HOLD
+    )
+
 def exec_command(cmd: dict) -> dict:
+    """Execute one command dictionary from Bus."""
     p = cmd.get("payload") or {}
     pnorm = _normalize_payload(p)
     venue = pnorm["venue"]
-    action = pnorm["action"]
-    side = pnorm["side"]
-    symbol = pnorm["symbol"]
+    side  = pnorm["side"]
+    symbol= pnorm["symbol"]
 
     if EDGE_HOLD:
-        return {"status":"held","message":"EDGE_HOLD enabled","fills":[], "venue":venue, "symbol":symbol, "side":side or action}
+        return {"status":"held","message":"EDGE_HOLD enabled","fills":[], "venue":venue, "symbol":symbol, "side":side or "?"}
 
+    # SWAP action (optional) — if payload says so
+    action = (p.get("action") or "").upper()
     if action == "SWAP":
         return handle_swap(cmd, pnorm)
 
-    if not side:
-        side = "BUY" if pnorm["amount_quote"] > 0 else "SELL"
-    if side == "BUY" and pnorm["amount_quote"] <= 0:
-        return {"status":"error","message":"BUY requires amount_quote > 0","fills":[],"venue":venue,"symbol":symbol,"side":side}
-    if side == "SELL" and pnorm["amount_base"] <= 0:
-        return {"status":"error","message":"SELL requires base_amount > 0","fills":[],"venue":venue,"symbol":symbol,"side":side}
-    # --- Pre-trade check & smart quote choice -----------------------------------
+    # Parse base/quote + fetch price
     base_sym, quote_sym = (symbol.split("-", 1) + [""])[:2] if "-" in symbol else (symbol, "USD")
-    px = fetch_price(venue, base_sym, quote_sym)  # your existing price helper
-    pnorm = normalize_amounts_from_intent(intent, px)
-    
+    px = fetch_price(venue, base_sym, quote_sym)
+
+    # Unambiguous amounts (default: amount is BASE unless flags include "quote")
+    amounts = normalize_amounts_from_intent(p, px)
+    amount_base  = amounts["amount_base"]
+    amount_quote = amounts["amount_quote"]
+
+    # Side fallback if not provided
+    if not side:
+        if amount_quote > 0: side = "BUY"
+        elif amount_base > 0: side = "SELL"
+        else:
+            return {"status":"error","message":"missing side/amount","fills":[],"venue":venue,"symbol":symbol,"side":side}
+
+    # Pre-trade guard: smart quote + venue min rules + wallet check
     venue_balances = get_balances().get(venue, {})
-    
     ok, reason, chosen_quote, min_qty, min_notional = pretrade_validate(
         venue=venue,
         base=base_sym,
         quote=quote_sym,
         price=px,
-        amount_base=pnorm["amount_base"],
-        amount_quote=pnorm["amount_quote"],
+        amount_base=amount_base,
+        amount_quote=amount_quote,
         venue_balances=venue_balances,
     )
     if not ok:
@@ -390,20 +375,22 @@ def exec_command(cmd: dict) -> dict:
             "venue":venue,"symbol":f"{base_sym}-{chosen_quote}","side":side,
             "executed_qty":None,"avg_price":None
         }
-    
-    # If quote was auto-updated, rewrite symbol for executor
-    if chosen_quote and chosen_quote != quote_sym:
-        symbol = f"{base_sym}-{chosen_quote}"
 
+    # If guard chose a different quote, switch symbol we send to the executor
+    if chosen_quote and chosen_quote != quote_sym:
+        quote_sym = chosen_quote
+        symbol = f"{base_sym}-{quote_sym}"
+
+    # Execute
     try:
-        res = EXECUTORS[_venue_key(venue)](
-            venue_symbol=resolve_symbol(venue, symbol.split("-")[0] if "-" in symbol else symbol, symbol.split("-")[1] if "-" in symbol else "USD"),
+        res = execute_market(
+            venue_key=venue,
+            base=base_sym,
+            quote=quote_sym,
             side=side,
-            amount_quote=pnorm["amount_quote"],
-            amount_base=pnorm["amount_base"],
-            client_id=str(cmd.get("id")),
-            edge_mode=EDGE_MODE,
-            edge_hold=EDGE_HOLD
+            amount_quote=amount_quote if side == "BUY" else 0.0,
+            amount_base=amount_base   if side == "SELL" else 0.0,
+            client_id=str(cmd.get("id"))
         )
     except Exception as e:
         return {"status":"error","message":str(e),"fills":[],"venue":venue,"symbol":symbol,"side":side}
@@ -413,45 +400,41 @@ def exec_command(cmd: dict) -> dict:
     res.setdefault("side", side)
     return res
 
-# --- ACK & receipts ----------------------------------------------------------
-def ack_command(cmd: dict, exec_result: dict) -> bool:
-    cid = cmd.get("id")
-    p = cmd.get("payload") or {}
+# =========================
+# ACK (durable-ish)
+# =========================
+_receipts_path = pathlib.Path("receipts.jsonl")
 
-    # Normalize status into Bus-friendly set
-    status_raw = (exec_result.get("status") or "").lower()
-    if status_raw == "ok":
-        status = "ok"
-    elif status_raw == "held":
-        status = "skipped"  # treat "held" as non-error skip
-    else:
-        status = "error"
-
-    detail = {
-        "venue":   exec_result.get("venue")  or p.get("venue"),
-        "symbol":  exec_result.get("symbol") or p.get("symbol") or p.get("product_id"),
-        "side":    exec_result.get("side")   or p.get("side")   or (p.get("action") or "").upper(),
-        "fills":   exec_result.get("fills", []),
-        "executed_qty": exec_result.get("executed_qty"),
-        "avg_price":    exec_result.get("avg_price"),
-        "mode": EDGE_MODE,
-        "note": exec_result.get("message", ""),
-        "ts": int(time.time()),
-    }
-
-    body = {"agent_id": AGENT_ID, "command_id": cid, "status": status, "detail": detail}
+def durable_ack(command_id, agent_id, status, detail):
     try:
-        r = _post_json("/api/commands/ack", body, secret=OUTBOX_SECRET, timeout=20)
-        _log(f"ack {cid} {r.status_code} {r.text[:160]}")
-        return r.ok
+        with _receipts_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": int(time.time()),
+                "agent_id": agent_id,
+                "command_id": command_id,
+                "status": status, "detail": detail
+            }) + "\n")
     except Exception as e:
-        _log(f"ack error {cid}: {e}")
-        return False
+        _log(f"receipts.jsonl append error: {e}")
 
-# --- Pull + loop -------------------------------------------------------------
+    backoff = 1
+    for _ in range(4):
+        try:
+            body = {"agent_id": agent_id, "command_id": command_id, "status": status, "detail": detail}
+            r = bus_post("/api/commands/ack", body, secret=OUTBOX_SECRET, timeout=20)
+            _log(f"ack {command_id} {r.status_code} {r.text[:160]}")
+            if r.ok: return True
+        except Exception as e:
+            _log(f"ack error {command_id}: {e}")
+        time.sleep(backoff); backoff = min(backoff * 2, 30)
+    return False
+
+# =========================
+# Pull loop
+# =========================
 def pull_once() -> list:
     body = {"agent_id": AGENT_ID, "max": MAX_PULL, "lease_seconds": LEASE_SECONDS}
-    r = _post_json("/api/commands/pull", body, secret=OUTBOX_SECRET, timeout=20)
+    r = bus_post("/api/commands/pull", body, secret=OUTBOX_SECRET, timeout=20)
     if r.status_code >= 400:
         raise requests.HTTPError(f"{r.status_code} {r.text[:200]}", response=r)
     try:
@@ -539,7 +522,9 @@ def maybe_balance_snapshot():
     except Exception as e:
         _log(f"snapshot KRAKEN error: {e}")
 
-# --- Main loop ---------------------------------------------------------------
+# =========================
+# Main
+# =========================
 def main():
     _log(f"online — mode={EDGE_MODE} hold={EDGE_HOLD} base={BASE_URL} agent={AGENT_ID}")
     backoff = 2
@@ -566,13 +551,21 @@ def main():
                     traceback.print_exc()
                     res = {"status":"error","message":str(e),"fills":[]}
 
-                try:
-                    ok = ack_command(cmd, res)
-                except Exception as e:
-                    _log(f"ack exception {cid}: {e}")
-                    ok = False
-
-                # Optional: you can mirror receipts elsewhere here if desired (left out by default)
+                # Normalize status & ACK
+                status_raw = (res.get("status") or "").lower()
+                status = "ok" if status_raw == "ok" else ("skipped" if status_raw == "held" else "error")
+                detail = {
+                    "venue":   res.get("venue")  or (cmd.get("payload") or {}).get("venue"),
+                    "symbol":  res.get("symbol") or (cmd.get("payload") or {}).get("symbol"),
+                    "side":    res.get("side")   or (cmd.get("payload") or {}).get("side"),
+                    "fills":   res.get("fills", []),
+                    "executed_qty": res.get("executed_qty"),
+                    "avg_price":    res.get("avg_price"),
+                    "mode": EDGE_MODE,
+                    "note": res.get("message", ""),
+                    "ts": int(time.time()),
+                }
+                durable_ack(cid, AGENT_ID, status, detail)
 
             maybe_heartbeat()
             maybe_balance_snapshot()
