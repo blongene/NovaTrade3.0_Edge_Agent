@@ -37,6 +37,7 @@ from executors.kraken_executor import execute_market_order as kr_exec
 from executors.coinbase_advanced_executor import CoinbaseCDP
 from executors.binance_us_executor import BinanceUS
 from executors.kraken_executor import _balance as kraken_balance
+from edge_pretrade import pretrade_validate
 
 # --- Optional telemetry stores ----------------------------------------------
 try:
@@ -344,6 +345,33 @@ def exec_command(cmd: dict) -> dict:
         return {"status":"error","message":"BUY requires amount_quote > 0","fills":[],"venue":venue,"symbol":symbol,"side":side}
     if side == "SELL" and pnorm["amount_base"] <= 0:
         return {"status":"error","message":"SELL requires base_amount > 0","fills":[],"venue":venue,"symbol":symbol,"side":side}
+    # --- Pre-trade check & smart quote choice (Kraken USD/USDT) -------------
+    base_sym, quote_sym = None, None
+    if "-" in symbol:
+        base_sym, quote_sym = symbol.split("-", 1)
+    else:
+        # fallback: guess BTC-USD if missing
+        base_sym, quote_sym = (symbol or "BTC-USD").split("-", 1)
+
+    # Best bid/ask price for notional math
+    px = fetch_price(venue, base_sym, quote_sym)
+    venue_balances = get_balances().get(venue, {})  # lightweight snapshot per call
+
+    ok, reason, chosen_quote, min_qty, min_notional = pretrade_validate(
+        venue=venue, base=base_sym, quote=quote_sym, price=px,
+        amount_base=pnorm["amount_base"], amount_quote=pnorm["amount_quote"],
+        venue_balances=venue_balances,
+    )
+    if not ok:
+        return {
+            "status":"error","message":reason,"fills":[],
+            "venue":venue,"symbol":f"{base_sym}-{chosen_quote}","side":side,
+            "executed_qty":None,"avg_price":None
+        }
+
+    # If quote was auto-updated (Kraken), fix symbol we pass to the executor
+    if chosen_quote and chosen_quote != quote_sym:
+        symbol = f"{base_sym}-{chosen_quote}"
 
     try:
         res = EXECUTORS[_venue_key(venue)](
