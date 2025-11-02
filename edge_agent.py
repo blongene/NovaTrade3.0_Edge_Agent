@@ -148,6 +148,29 @@ def resolve_symbol(venue_key: str, base: str, quote: str) -> str:
         return _kr_sym(base, quote)
     return f"{base.upper()}-{quote.upper()}"
 
+def normalize_amounts_from_intent(intent: dict, price: float) -> dict:
+    """
+    Returns dict with amount_base and amount_quote consistent with intent.
+    Defaults: 'amount' is BASE units. If flags includes 'quote', 'amount' is QUOTE notional.
+    """
+    amt = float(intent.get("amount", 0) or 0)
+    flags = set([str(x).lower() for x in intent.get("flags", [])])
+
+    out = {"amount_base": 0.0, "amount_quote": 0.0}
+
+    if "quote" in flags:
+        # spend in QUOTE (e.g., dollars)
+        out["amount_quote"] = max(0.0, amt)
+        if price and price > 0:
+            out["amount_base"] = out["amount_quote"] / float(price)
+    else:
+        # default: amount is BASE units
+        out["amount_base"] = max(0.0, amt)
+        if price and price > 0:
+            out["amount_quote"] = out["amount_base"] * float(price)
+
+    return out
+
 # --- Public price fetchers ---------------------------------------------------
 def fetch_price(venue_key: str, base: str, quote: str) -> float:
     v = _venue_key(venue_key)
@@ -347,9 +370,11 @@ def exec_command(cmd: dict) -> dict:
         return {"status":"error","message":"SELL requires base_amount > 0","fills":[],"venue":venue,"symbol":symbol,"side":side}
     # --- Pre-trade check & smart quote choice -----------------------------------
     base_sym, quote_sym = (symbol.split("-", 1) + [""])[:2] if "-" in symbol else (symbol, "USD")
-    px = fetch_price(venue, base_sym, quote_sym)           # your existing best price helper
-    venue_balances = get_balances().get(venue, {})         # your in-memory balances
-
+    px = fetch_price(venue, base_sym, quote_sym)  # your existing price helper
+    pnorm = normalize_amounts_from_intent(intent, px)
+    
+    venue_balances = get_balances().get(venue, {})
+    
     ok, reason, chosen_quote, min_qty, min_notional = pretrade_validate(
         venue=venue,
         base=base_sym,
@@ -365,8 +390,8 @@ def exec_command(cmd: dict) -> dict:
             "venue":venue,"symbol":f"{base_sym}-{chosen_quote}","side":side,
             "executed_qty":None,"avg_price":None
         }
-
-    # If we auto-changed quote, update symbol passed to executor
+    
+    # If quote was auto-updated, rewrite symbol for executor
     if chosen_quote and chosen_quote != quote_sym:
         symbol = f"{base_sym}-{chosen_quote}"
 
