@@ -228,7 +228,7 @@ def _normalize_payload(p: dict):
         "side":  side,
         "symbol": symbol,
         "from":  (p.get("from") or p.get("asset_from") or "").upper(),
-        "to":    (p.get("to") or p.get("asset_to") or p.get("quote") or "").upper(),
+        "to":    (p.get("asset_to") or p.get("quote") or "").upper(),
         "flags": p.get("flags", []),
         "note":  p.get("note") or "",
     }
