@@ -7,7 +7,13 @@
 # - ACKs to /api/commands/ack (HMAC-signed) with durable detail
 # - Heartbeat + balance snapshots + balance telemetry push
 
-import os, time, json, hmac, hashlib, requests, re, traceback, collections, pathlib
+import os
+POLLER_ENABLED = (os.getenv('POLLER_ENABLED') or '1').lower() in {'1','true','yes'}
+POLLER_WAIT_SEC = int(os.getenv('POLLER_WAIT_SEC') or '2')
+POLLER_MAX_RETRY = int(os.getenv('POLLER_MAX_RETRY') or '3')
+from pollers.coinbase_poll import poll_coinbase
+from pollers.binanceus_poll import poll_binanceus
+from pollers.kraken_poll import poll_kraken, time, json, hmac, hashlib, requests, re, traceback, collections, pathlib
 from typing import Dict, Any
 
 # =========================
@@ -395,27 +401,9 @@ def exec_command(cmd: dict) -> dict:
     except Exception as e:
         return {"status":"error","message":str(e),"fills":[],"venue":venue,"symbol":symbol,"side":side}
 
-    # Normalize venue/symbol/side from payload (authoritative for receipts)
-    res.setdefault("venue", (p.get("venue") or venue))
-    res.setdefault("symbol", (p.get("symbol") or symbol))
-    res.setdefault("side", (p.get("side") or side))
-
-    # If executor returned fills, compute executed_qty and avg_price if missing
-    try:
-        if res.get("fills"):
-            qty = 0.0
-            notional = 0.0
-            for f in res["fills"]:
-                q = float(f.get("qty") or f.get("quantity") or f.get("executed_qty") or 0.0)
-                px = float(f.get("price") or f.get("avg_price") or 0.0)
-                if q and px:
-                    qty += q
-                    notional += q*px
-            if qty > 0 and notional > 0:
-                res.setdefault("executed_qty", qty)
-                res.setdefault("avg_price", round(notional/qty, 12))
-    except Exception:
-        pass
+    res.setdefault("venue", venue)
+    res.setdefault("symbol", symbol)
+    res.setdefault("side", side)
     return res
 
 # =========================
@@ -604,3 +592,22 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def poll_for_fills(venue_key: str, symbol: str, client_id: str):
+    if not POLLER_ENABLED:
+        return None
+    v = venue_key.upper()
+    try:
+        if v in ('COINBASE','COINBASEADV','CBADV'):
+            return poll_coinbase(client_id=client_id, venue_symbol=symbol, wait_sec=POLLER_WAIT_SEC, max_retry=POLLER_MAX_RETRY)
+        if v in ('BINANCEUS','BUSA'):
+            return poll_binanceus(client_id=client_id, venue_symbol=symbol, wait_sec=POLLER_WAIT_SEC, max_retry=POLLER_MAX_RETRY)
+        if v == 'KRAKEN':
+            return poll_kraken(client_id=client_id, venue_symbol=symbol, wait_sec=POLLER_WAIT_SEC, max_retry=POLLER_MAX_RETRY)
+    except Exception as e:
+        try:
+            _log(f'poller error {venue_key} {symbol}: {e}')
+        except Exception:
+            pass
+    return None
