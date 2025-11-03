@@ -314,6 +314,26 @@ def handle_swap(cmd: dict, pnorm: dict) -> dict:
             continue
     return {"status":"error","message":"SWAP failed: no viable path","fills":[]}
 
+# --- Policy-lite guard ---------------------------------------------
+from edge_policy import enforce_pretrade
+
+wallet_quotes = {
+    "USDT": balances.get("USDT", 0),
+    "USDC": balances.get("USDC", 0),
+    "USD":  balances.get("USD", 0),
+}
+allowed, msg, adj_amount = enforce_pretrade(
+    venue, symbol, side, amount_quote, wallet_quotes
+)
+if not allowed:
+    log.warning(f"[policy] rejected: {msg}")
+    send_receipt(command_id, venue, symbol, side, "error",
+                 {"note": msg, "mode": mode})
+    continue  # skip this intent
+
+amount_quote = adj_amount
+# -------------------------------------------------------------------
+
 # =========================
 # Execution
 # =========================
