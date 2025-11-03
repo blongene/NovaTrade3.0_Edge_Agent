@@ -11,9 +11,9 @@ import os
 POLLER_ENABLED = (os.getenv('POLLER_ENABLED') or '1').lower() in {'1','true','yes'}
 POLLER_WAIT_SEC = int(os.getenv('POLLER_WAIT_SEC') or '2')
 POLLER_MAX_RETRY = int(os.getenv('POLLER_MAX_RETRY') or '3')
-from pollers.coinbase_poll import poll_coinbase
-from pollers.binanceus_poll import poll_binanceus
-from pollers.kraken_poll import poll_kraken, time, json, hmac, hashlib, requests, re, traceback, collections, pathlib
+from coinbase_poll import poll_coinbase
+from binanceus_poll import poll_binanceus
+from kraken_poll import poll_kraken, time, json, hmac, hashlib, requests, re, traceback, collections, pathlib
 from typing import Dict, Any
 
 # =========================
