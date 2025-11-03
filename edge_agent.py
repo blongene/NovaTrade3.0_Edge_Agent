@@ -228,7 +228,7 @@ def _normalize_payload(p: dict):
         "side":  side,
         "symbol": symbol,
         "from":  (p.get("from") or p.get("asset_from") or "").upper(),
-        "to":    (p.get("asset_to") or p.get("quote") or "").upper(),
+        "to":    (p.get("to") or p.get("asset_to") or p.get("quote") or "").upper(),
         "flags": p.get("flags", []),
         "note":  p.get("note") or "",
     }
@@ -395,9 +395,27 @@ def exec_command(cmd: dict) -> dict:
     except Exception as e:
         return {"status":"error","message":str(e),"fills":[],"venue":venue,"symbol":symbol,"side":side}
 
-    res.setdefault("venue", venue)
-    res.setdefault("symbol", symbol)
-    res.setdefault("side", side)
+    # Normalize venue/symbol/side from payload (authoritative for receipts)
+    res.setdefault("venue", (p.get("venue") or venue))
+    res.setdefault("symbol", (p.get("symbol") or symbol))
+    res.setdefault("side", (p.get("side") or side))
+
+    # If executor returned fills, compute executed_qty and avg_price if missing
+    try:
+        if res.get("fills"):
+            qty = 0.0
+            notional = 0.0
+            for f in res["fills"]:
+                q = float(f.get("qty") or f.get("quantity") or f.get("executed_qty") or 0.0)
+                px = float(f.get("price") or f.get("avg_price") or 0.0)
+                if q and px:
+                    qty += q
+                    notional += q*px
+            if qty > 0 and notional > 0:
+                res.setdefault("executed_qty", qty)
+                res.setdefault("avg_price", round(notional/qty, 12))
+    except Exception:
+        pass
     return res
 
 # =========================
