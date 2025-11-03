@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from edge_policy import enforce_pretrade
+
 # edge_agent.py — NovaTrade Edge Agent (Phase B ready)
 #
 # - Polls /api/commands/pull (HMAC-signed)
@@ -7,14 +9,7 @@
 # - ACKs to /api/commands/ack (HMAC-signed) with durable detail
 # - Heartbeat + balance snapshots + balance telemetry push
 
-import os, sys, time, json, hmac, hashlib, traceback, re, collections, pathlib
-import requests  
-POLLER_ENABLED = (os.getenv('POLLER_ENABLED') or '1').lower() in {'1','true','yes'}
-POLLER_WAIT_SEC = int(os.getenv('POLLER_WAIT_SEC') or '2')
-POLLER_MAX_RETRY = int(os.getenv('POLLER_MAX_RETRY') or '3')
-from pollers.coinbase_poll import poll_coinbase
-from pollers.binanceus_poll import poll_binanceus
-from pollers.kraken_poll import poll_kraken
+import os, time, json, hmac, hashlib, requests, re, traceback, collections, pathlib
 from typing import Dict, Any
 
 # =========================
@@ -314,26 +309,6 @@ def handle_swap(cmd: dict, pnorm: dict) -> dict:
             continue
     return {"status":"error","message":"SWAP failed: no viable path","fills":[]}
 
-# --- Policy-lite guard ---------------------------------------------
-from edge_policy import enforce_pretrade
-
-wallet_quotes = {
-    "USDT": balances.get("USDT", 0),
-    "USDC": balances.get("USDC", 0),
-    "USD":  balances.get("USD", 0),
-}
-allowed, msg, adj_amount = enforce_pretrade(
-    venue, symbol, side, amount_quote, wallet_quotes
-)
-if not allowed:
-    log.warning(f"[policy] rejected: {msg}")
-    send_receipt(command_id, venue, symbol, side, "error",
-                 {"note": msg, "mode": mode})
-    continue  # skip this intent
-
-amount_quote = adj_amount
-# -------------------------------------------------------------------
-
 # =========================
 # Execution
 # =========================
@@ -615,20 +590,10 @@ if __name__ == "__main__":
     main()
 
 
-def poll_for_fills(venue_key: str, symbol: str, client_id: str):
-    if not POLLER_ENABLED:
-        return None
-    v = venue_key.upper()
-    try:
-        if v in ('COINBASE','COINBASEADV','CBADV'):
-            return poll_coinbase(client_id=client_id, venue_symbol=symbol, wait_sec=POLLER_WAIT_SEC, max_retry=POLLER_MAX_RETRY)
-        if v in ('BINANCEUS','BUSA'):
-            return poll_binanceus(client_id=client_id, venue_symbol=symbol, wait_sec=POLLER_WAIT_SEC, max_retry=POLLER_MAX_RETRY)
-        if v == 'KRAKEN':
-            return poll_kraken(client_id=client_id, venue_symbol=symbol, wait_sec=POLLER_WAIT_SEC, max_retry=POLLER_MAX_RETRY)
-    except Exception as e:
-        try:
-            _log(f'poller error {venue_key} {symbol}: {e}')
-        except Exception:
-            pass
-    return None
+# --- Policy-lite guard helper (call this before placing an order) ---
+def policy_precheck(venue, symbol, side, amount_quote, wallet_quotes):
+    allowed, msg, fixed_amount = enforce_pretrade(
+        venue, symbol, side, amount_quote, wallet_quotes
+    )
+    return allowed, msg, fixed_amount
+# -------------------------------------------------------------------
