@@ -7,7 +7,8 @@
 # - ACKs to /api/commands/ack (HMAC-signed) with durable detail
 # - Heartbeat + balance snapshots + balance telemetry push
 
-import os
+import os, sys, time, json, hmac, hashlib, traceback, re, collections, pathlib
+import requests  
 POLLER_ENABLED = (os.getenv('POLLER_ENABLED') or '1').lower() in {'1','true','yes'}
 POLLER_WAIT_SEC = int(os.getenv('POLLER_WAIT_SEC') or '2')
 POLLER_MAX_RETRY = int(os.getenv('POLLER_MAX_RETRY') or '3')
