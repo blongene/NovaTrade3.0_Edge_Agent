@@ -1,20 +1,18 @@
-
 #!/usr/bin/env python3
 # edge_agent.py — NovaTrade Edge Agent (policy-aware, hold-aware drop-in)
+# Fixed: include maybe_push_balances() to prevent NameError and safely push telemetry if available.
 #
-# Key changes vs your current file:
-# • Pulls and ACKs even when EDGE_HOLD=true (no early return), so the queue drains safely.
-# • When held, ACKs with status=skipped and includes observations (price_usd, quote_reserve_usd).
-# • Adds price_usd from public endpoints and computes quote_reserve_usd from venue balances.
-# • Uses only existing env vars from NovaTrade3.0.env (no new ones).
-#
-# Compatible with: Bus Phase-B/C, pretrade_validate, existing executors.
+# Behavior:
+# • Pulls and ACKs even when EDGE_HOLD=true (drains queue; ACK status=skipped with observations).
+# • Computes price_usd via public endpoints; computes quote_reserve_usd from balances.
+# • Auto-sizes BUYs: base amount → quote using price (or use flags:["quote"] to pass quote directly).
+# • Uses ONLY existing env vars from your NovaTrade3.0 envs.
 
 import os, time, json, hmac, hashlib, requests, re, traceback, collections, pathlib
 from typing import Dict, Any, Optional
 
 # =========================
-# Venue executors (yours)
+# Venue executors (your existing modules)
 # =========================
 from executors.coinbase_advanced_executor import execute_market_order as cb_exec
 from executors.binance_us_executor     import execute_market_order as bus_exec
@@ -24,10 +22,10 @@ from executors.coinbase_advanced_executor import CoinbaseCDP
 from executors.binance_us_executor     import BinanceUS
 from executors.kraken_executor         import _balance as kraken_balance
 
-# Pre-trade rules
+# Pre-trade policy gates
 from edge_pretrade import pretrade_validate
 
-# Optional local stores (best-effort)
+# Optional telemetry modules (best-effort)
 try:
     import telemetry_db
 except Exception:
@@ -98,7 +96,7 @@ def bus_post(path: str, body: Dict[str, Any], secret: str = OUTBOX_SECRET, timeo
     return SESSION.post(url, json=body, headers=headers, timeout=timeout)
 
 # =========================
-# Executors registry + sym
+# Executors registry + symbol helpers
 # =========================
 EXECUTORS = {
     "COINBASE":    cb_exec,
@@ -193,7 +191,7 @@ def compute_quote_reserve_usd(venue: str, quote: str, by_venue: dict) -> Optiona
     return None
 
 # =========================
-# Amount normalization
+# Amount normalization (auto base→quote using price)
 # =========================
 def normalize_amounts_from_intent(intent: dict, price: float) -> dict:
     amt = float(intent.get("amount", 0) or 0)
@@ -394,6 +392,7 @@ def _seen_before(cid) -> bool:
 
 _last_hb = 0.0
 _last_bal_snap = 0.0
+_last_push_bal = 0.0
 
 def maybe_heartbeat():
     global _last_hb
@@ -463,6 +462,23 @@ def maybe_balance_snapshot():
     except Exception as e:
         _log(f"snapshot KRAKEN error: {e}")
 
+def maybe_push_balances():
+    """Best-effort push of balances to Bus if enabled; safe no-op if telemetry_sync missing."""
+    global _last_push_bal
+    if not PUSH_BALANCES_ENABLED or telemetry_sync is None:
+        return
+    now = time.time()
+    if now - _last_push_bal < max(60, PUSH_BALANCES_EVERY_S):
+        return
+    _last_push_bal = now
+    try:
+        if hasattr(telemetry_sync, "push_telemetry"):
+            telemetry_sync.push_telemetry()
+        if TELEMETRY_VERBOSE:
+            _log("balances push: ok")
+    except Exception as e:
+        _log(f"balances push error: {e}")
+
 # =========================
 # Main
 # =========================
@@ -471,7 +487,7 @@ def main():
     backoff = 2
     while True:
         try:
-            # IMPORTANT: do NOT skip when EDGE_HOLD=true — still pull and ACK 'skipped'
+            # Do NOT skip when EDGE_HOLD=true — still pull and ACK 'skipped'
             cmds = pull_once()
             if cmds:
                 _log(f"received {len(cmds)} command(s)")
