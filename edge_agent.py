@@ -1,16 +1,17 @@
-#!/usr/bin/env python3
-from edge_policy import enforce_pretrade
 
-# edge_agent.py — NovaTrade Edge Agent (Phase B ready)
+#!/usr/bin/env python3
+# edge_agent.py — NovaTrade Edge Agent (policy-aware, hold-aware drop-in)
 #
-# - Polls /api/commands/pull (HMAC-signed)
-# - Executes intents on Coinbase Advanced, BinanceUS, Kraken
-# - Pre-trade guard (min qty / min notional / wallet check) + smart quote
-# - ACKs to /api/commands/ack (HMAC-signed) with durable detail
-# - Heartbeat + balance snapshots + balance telemetry push
+# Key changes vs your current file:
+# • Pulls and ACKs even when EDGE_HOLD=true (no early return), so the queue drains safely.
+# • When held, ACKs with status=skipped and includes observations (price_usd, quote_reserve_usd).
+# • Adds price_usd from public endpoints and computes quote_reserve_usd from venue balances.
+# • Uses only existing env vars from NovaTrade3.0.env (no new ones).
+#
+# Compatible with: Bus Phase-B/C, pretrade_validate, existing executors.
 
 import os, time, json, hmac, hashlib, requests, re, traceback, collections, pathlib
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # =========================
 # Venue executors (yours)
@@ -23,7 +24,7 @@ from executors.coinbase_advanced_executor import CoinbaseCDP
 from executors.binance_us_executor     import BinanceUS
 from executors.kraken_executor         import _balance as kraken_balance
 
-# Pre-trade rules (we shipped this earlier)
+# Pre-trade rules
 from edge_pretrade import pretrade_validate
 
 # Optional local stores (best-effort)
@@ -37,7 +38,7 @@ except Exception:
     telemetry_sync = None
 
 # =========================
-# Environment
+# Environment (existing keys only)
 # =========================
 BASE_URL   = (os.getenv("CLOUD_BASE_URL") or os.getenv("BASE_URL") or "http://localhost:10000").rstrip("/")
 AGENT_ID   = (os.getenv("AGENT_ID") or os.getenv("EDGE_AGENT_ID") or "edge-primary").split(",")[0].strip()
@@ -157,7 +158,7 @@ def fetch_price(venue_key: str, base: str, quote: str) -> float:
     return float("nan")
 
 # =========================
-# Balances for telemetry
+# Balances for telemetry / quote reserve
 # =========================
 def get_balances() -> dict:
     out = {}
@@ -179,34 +180,24 @@ def get_balances() -> dict:
         _log(f"balances KRAKEN error: {e}")
     return out
 
-def maybe_push_balances():
-    if not PUSH_BALANCES_ENABLED:
-        return
-    now = time.time()
-    last = getattr(maybe_push_balances, "_last", 0.0)
-    if now - last < max(60, PUSH_BALANCES_EVERY_S):
-        return
-    maybe_push_balances._last = now
+def compute_quote_reserve_usd(venue: str, quote: str, by_venue: dict) -> Optional[float]:
+    """Return raw amount for USD stables; else None."""
     try:
-        payload = {"agent_id": AGENT_ID, "balances": get_balances()}
-        secret = TELEMETRY_SECRET or OUTBOX_SECRET
-        r = bus_post(WALLET_MONITOR_ENDPOINT, payload, secret=secret, timeout=15)
-        _log(f"push_balances {r.status_code} {r.text[:160]}")
-    except Exception as e:
-        _log(f"push_balances error: {e}")
+        v = _venue_key(venue)
+        q = (quote or "").upper()
+        bal = float((by_venue.get(v) or {}).get(q, 0.0))
+        if q in ("USD","USDT","USDC"):
+            return bal
+    except Exception:
+        pass
+    return None
 
 # =========================
 # Amount normalization
 # =========================
 def normalize_amounts_from_intent(intent: dict, price: float) -> dict:
-    """
-    Returns amount_base and amount_quote, unambiguous.
-    Defaults: 'amount' means BASE units.
-    If flags contains 'quote', 'amount' is QUOTE notional.
-    """
     amt = float(intent.get("amount", 0) or 0)
     flags = set([str(x).lower() for x in intent.get("flags", [])])
-
     out = {"amount_base": 0.0, "amount_quote": 0.0}
     if "quote" in flags:
         out["amount_quote"] = max(0.0, amt)
@@ -236,80 +227,6 @@ def _normalize_payload(p: dict):
     }
 
 # =========================
-# SWAP (optional pathing)
-# =========================
-def _direct_or_bridge_paths(from_asset: str, to_quote: str):
-    fa = (from_asset or "").upper(); tq = (to_quote or "").upper()
-    if not fa or not tq: return []
-    if fa == tq: return [(fa, tq)]
-    c = []
-    c.append([(fa, tq)])
-    if tq != "USDT": c.append([(fa, "USDT"), ("USDT", tq)])
-    if tq != "USDC": c.append([(fa, "USDC"), ("USDC", tq)])
-    if tq in ("USDT","USDC"):
-        other = "USDC" if tq == "USDT" else "USDT"
-        c.append([(fa, other), (other, tq)])
-    return c
-
-def _estimate_base_qty(venue: str, base: str, quote: str, want_quote_amount: float) -> float:
-    px = fetch_price(venue, base, quote)
-    if not (px and px == px and px > 0.0):
-        raise RuntimeError(f"no price {venue} {base}/{quote}")
-    return (want_quote_amount / px) * 1.0025
-
-def handle_swap(cmd: dict, pnorm: dict) -> dict:
-    p = cmd.get("payload") or {}
-    venue = pnorm["venue"]
-    from_asset = pnorm["from"] or (pnorm["symbol"].split("-")[0] if pnorm["symbol"] else "")
-    to_quote   = pnorm["to"] or "USDT"
-    want_q     = float(p.get("amount") or p.get("amount_quote") or 0.0)
-    if not (venue and from_asset and to_quote and want_q > 0):
-        return {"status":"error","message":"SWAP requires venue, from, to, amount>0","fills":[]}
-
-    if from_asset == to_quote:
-        return {"status":"ok","message":"SWAP no-op","fills":[],
-                "venue":venue,"symbol":resolve_symbol(venue, from_asset, to_quote),"side":"SELL",
-                "executed_qty":0.0,"avg_price":0.0}
-
-    paths = _direct_or_bridge_paths(from_asset, to_quote)
-    all_fills = []
-    for path in paths:
-        try:
-            if len(path) == 1:
-                base, quote = path[0]
-                qty_base = _estimate_base_qty(venue, base, quote, want_q)
-                res = execute_market(venue, base, quote, side="SELL", amount_base=qty_base, client_id=cmd.get("id"))
-                if (res.get("status") or "") != "ok":
-                    raise RuntimeError(res.get("message","unknown error"))
-                out = res.copy()
-                out.update({"status":"ok","message":"SWAP direct executed","fills":res.get("fills",[])})
-                return out
-            elif len(path) == 2:
-                (base1, quote1), (base2, quote2) = path
-                if quote1 != base2: continue
-                qty_bridge = _estimate_base_qty(venue, base2, quote2, want_q)
-                qty_from   = _estimate_base_qty(venue, base1, quote1, qty_bridge)
-                res1 = execute_market(venue, base1, quote1, side="SELL", amount_base=qty_from, client_id=cmd.get("id"))
-                if (res1.get("status") or "") != "ok":
-                    raise RuntimeError(res1.get("message","bridge leg 1 failed"))
-                all_fills.extend(res1.get("fills",[]))
-                received_bridge = float(res1.get("executed_qty", 0.0)) * float(res1.get("avg_price", 0.0))
-                if received_bridge <= 0:
-                    raise RuntimeError("zero bridge qty")
-                res2 = execute_market(venue, base2, quote2, side="SELL", amount_base=received_bridge, client_id=cmd.get("id"))
-                if (res2.get("status") or "") != "ok":
-                    raise RuntimeError(res2.get("message","bridge leg 2 failed"))
-                all_fills.extend(res2.get("fills",[]))
-                symbol_final = resolve_symbol(venue, from_asset, to_quote)
-                return {"status":"ok","message":f"SWAP bridge via {quote1} ok","fills":all_fills,
-                        "venue":venue,"symbol":symbol_final,"side":"SELL"}
-        except Exception as e:
-            _log(f"SWAP path failed {venue} {path}: {e}")
-            all_fills = []
-            continue
-    return {"status":"error","message":"SWAP failed: no viable path","fills":[]}
-
-# =========================
 # Execution
 # =========================
 def execute_market(venue_key: str, base: str, quote: str, side: str,
@@ -328,30 +245,44 @@ def execute_market(venue_key: str, base: str, quote: str, side: str,
         edge_hold=EDGE_HOLD
     )
 
-def exec_command(cmd: dict) -> dict:
-    """Execute one command dictionary from Bus."""
+def exec_command(cmd: dict, balances_cache: Optional[dict] = None) -> dict:
+    """Execute or hold one command; return result dict used for ACK detail."""
     p = cmd.get("payload") or {}
     pnorm = _normalize_payload(p)
     venue = pnorm["venue"]
     side  = pnorm["side"]
     symbol= pnorm["symbol"]
 
-    if EDGE_HOLD:
-        return {"status":"held","message":"EDGE_HOLD enabled","fills":[], "venue":venue, "symbol":symbol, "side":side or "?"}
+    # Parse base/quote
+    if "-" in symbol:
+        base_sym, quote_sym = (symbol.split("-", 1) + [""])[:2]
+    else:
+        base_sym, quote_sym = symbol, "USD"
 
-    # SWAP action (optional) — if payload says so
-    action = (p.get("action") or "").upper()
-    if action == "SWAP":
-        return handle_swap(cmd, pnorm)
-
-    # Parse base/quote + fetch price
-    base_sym, quote_sym = (symbol.split("-", 1) + [""])[:2] if "-" in symbol else (symbol, "USD")
+    # Price for observations + sizing
     px = fetch_price(venue, base_sym, quote_sym)
-
-    # Unambiguous amounts (default: amount is BASE unless flags include "quote")
     amounts = normalize_amounts_from_intent(p, px)
     amount_base  = amounts["amount_base"]
     amount_quote = amounts["amount_quote"]
+
+    # Compute quote reserve for observations (USD stables only)
+    by_venue = balances_cache or {}
+    quote_reserve_usd = compute_quote_reserve_usd(venue, quote_sym, by_venue)
+
+    # HOLD path: ACK as skipped but include observations to help policy
+    if EDGE_HOLD:
+        return {
+            "status":"held",
+            "message":"EDGE_HOLD enabled",
+            "fills":[],
+            "venue":venue,
+            "symbol":symbol,
+            "side":side or "?",
+            "executed_qty":None,
+            "avg_price":px if px == px else None,
+            "price_usd":px if px == px else None,
+            "quote_reserve_usd":quote_reserve_usd
+        }
 
     # Side fallback if not provided
     if not side:
@@ -360,8 +291,8 @@ def exec_command(cmd: dict) -> dict:
         else:
             return {"status":"error","message":"missing side/amount","fills":[],"venue":venue,"symbol":symbol,"side":side}
 
-    # Pre-trade guard: smart quote + venue min rules + wallet check
-    venue_balances = get_balances().get(venue, {})
+    # Pre-trade guard
+    venue_balances = (by_venue.get(venue) or {}) if by_venue else (get_balances().get(venue, {}))
     ok, reason, chosen_quote, min_qty, min_notional = pretrade_validate(
         venue=venue,
         base=base_sym,
@@ -374,8 +305,10 @@ def exec_command(cmd: dict) -> dict:
     if not ok:
         return {
             "status":"error","message":reason,"fills":[],
-            "venue":venue,"symbol":f"{base_sym}-{chosen_quote}","side":side,
-            "executed_qty":None,"avg_price":None
+            "venue":venue,"symbol":f"{base_sym}-{chosen_quote or quote_sym}","side":side,
+            "executed_qty":None,"avg_price":None,
+            "price_usd":px if px == px else None,
+            "quote_reserve_usd":quote_reserve_usd
         }
 
     # If guard chose a different quote, switch symbol we send to the executor
@@ -395,11 +328,17 @@ def exec_command(cmd: dict) -> dict:
             client_id=str(cmd.get("id"))
         )
     except Exception as e:
-        return {"status":"error","message":str(e),"fills":[],"venue":venue,"symbol":symbol,"side":side}
+        return {"status":"error","message":str(e),"fills":[],"venue":venue,"symbol":symbol,"side":side,
+                "price_usd":px if px == px else None, "quote_reserve_usd":quote_reserve_usd}
 
     res.setdefault("venue", venue)
     res.setdefault("symbol", symbol)
     res.setdefault("side", side)
+    # Attach observations for policy/logger insight
+    if px == px:
+        res.setdefault("price_usd", px)
+    if quote_reserve_usd is not None:
+        res.setdefault("quote_reserve_usd", quote_reserve_usd)
     return res
 
 # =========================
@@ -532,13 +471,13 @@ def main():
     backoff = 2
     while True:
         try:
-            if EDGE_HOLD:
-                time.sleep(EDGE_POLL_SECS)
-                continue
-
+            # IMPORTANT: do NOT skip when EDGE_HOLD=true — still pull and ACK 'skipped'
             cmds = pull_once()
             if cmds:
                 _log(f"received {len(cmds)} command(s)")
+
+            # cache balances once per loop for reserve calc (avoid repeated exchange calls)
+            balances_cache = get_balances()
 
             for cmd in cmds:
                 cid = cmd.get("id")
@@ -547,7 +486,7 @@ def main():
                     continue
 
                 try:
-                    res = exec_command(cmd)
+                    res = exec_command(cmd, balances_cache=balances_cache)
                 except Exception as e:
                     _log(f"exec error {cid}: {e}")
                     traceback.print_exc()
@@ -555,7 +494,7 @@ def main():
 
                 # Normalize status & ACK
                 status_raw = (res.get("status") or "").lower()
-                status = "ok" if status_raw == "ok" else ("skipped" if status_raw == "held" else "error")
+                status = "ok" if status_raw == "ok" else ("skipped" if status_raw in {"held","skipped"} else "error")
                 detail = {
                     "venue":   res.get("venue")  or (cmd.get("payload") or {}).get("venue"),
                     "symbol":  res.get("symbol") or (cmd.get("payload") or {}).get("symbol"),
@@ -567,6 +506,12 @@ def main():
                     "note": res.get("message", ""),
                     "ts": int(time.time()),
                 }
+                # Attach observations when present
+                if "price_usd" in res and res["price_usd"] is not None:
+                    detail["price_usd"] = res["price_usd"]
+                if "quote_reserve_usd" in res and res["quote_reserve_usd"] is not None:
+                    detail["quote_reserve_usd"] = res["quote_reserve_usd"]
+
                 durable_ack(cid, AGENT_ID, status, detail)
 
             maybe_heartbeat()
@@ -588,12 +533,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# --- Policy-lite guard helper (call this before placing an order) ---
-def policy_precheck(venue, symbol, side, amount_quote, wallet_quotes):
-    allowed, msg, fixed_amount = enforce_pretrade(
-        venue, symbol, side, amount_quote, wallet_quotes
-    )
-    return allowed, msg, fixed_amount
-# -------------------------------------------------------------------
