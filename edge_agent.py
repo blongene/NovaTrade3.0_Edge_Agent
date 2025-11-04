@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 # edge_agent.py — NovaTrade Edge Agent (policy-aware, hold-aware drop-in)
-# Fixed: include maybe_push_balances() to prevent NameError and safely push telemetry if available.
-#
-# Behavior:
-# • Pulls and ACKs even when EDGE_HOLD=true (drains queue; ACK status=skipped with observations).
-# • Computes price_usd via public endpoints; computes quote_reserve_usd from balances.
-# • Auto-sizes BUYs: base amount → quote using price (or use flags:["quote"] to pass quote directly).
-# • Uses ONLY existing env vars from your NovaTrade3.0 envs.
+# Adds parse_symbol() so BTCUSDT-style symbols work; includes safe maybe_push_balances().
 
+from __future__ import annotations
 import os, time, json, hmac, hashlib, requests, re, traceback, collections, pathlib
 from typing import Dict, Any, Optional
 
 # =========================
-# Venue executors (your existing modules)
+# Venue executors
 # =========================
 from executors.coinbase_advanced_executor import execute_market_order as cb_exec
 from executors.binance_us_executor     import execute_market_order as bus_exec
@@ -130,6 +125,18 @@ def resolve_symbol(venue_key: str, base: str, quote: str) -> str:
     if v == "KRAKEN":                            return _kr_sym(base, quote)
     return f"{base.upper()}-{quote.upper()}"
 
+# --- NEW: smarter symbol parser ----------------------------------------------
+STABLE_SUFFIXES = ("USDT","USDC","USD")
+def parse_symbol(symbol: str) -> tuple[str, str]:
+    s = (symbol or "").upper()
+    if "-" in s:
+        base, quote = (s.split("-", 1) + [""])[:2]
+        return base, quote
+    m = re.match(r"^([A-Z0-9]+?)(USDT|USDC|USD)$", s)
+    if m:
+        return m.group(1), m.group(2)
+    return s, "USD"
+
 # =========================
 # Price fetch (public)
 # =========================
@@ -179,7 +186,6 @@ def get_balances() -> dict:
     return out
 
 def compute_quote_reserve_usd(venue: str, quote: str, by_venue: dict) -> Optional[float]:
-    """Return raw amount for USD stables; else None."""
     try:
         v = _venue_key(venue)
         q = (quote or "").upper()
@@ -244,18 +250,14 @@ def execute_market(venue_key: str, base: str, quote: str, side: str,
     )
 
 def exec_command(cmd: dict, balances_cache: Optional[dict] = None) -> dict:
-    """Execute or hold one command; return result dict used for ACK detail."""
     p = cmd.get("payload") or {}
     pnorm = _normalize_payload(p)
     venue = pnorm["venue"]
     side  = pnorm["side"]
     symbol= pnorm["symbol"]
 
-    # Parse base/quote
-    if "-" in symbol:
-        base_sym, quote_sym = (symbol.split("-", 1) + [""])[:2]
-    else:
-        base_sym, quote_sym = symbol, "USD"
+    # Parse base/quote (supports BTC-USDT and BTCUSDT styles)
+    base_sym, quote_sym = parse_symbol(symbol)
 
     # Price for observations + sizing
     px = fetch_price(venue, base_sym, quote_sym)
@@ -267,7 +269,7 @@ def exec_command(cmd: dict, balances_cache: Optional[dict] = None) -> dict:
     by_venue = balances_cache or {}
     quote_reserve_usd = compute_quote_reserve_usd(venue, quote_sym, by_venue)
 
-    # HOLD path: ACK as skipped but include observations to help policy
+    # HOLD path
     if EDGE_HOLD:
         return {
             "status":"held",
@@ -332,7 +334,6 @@ def exec_command(cmd: dict, balances_cache: Optional[dict] = None) -> dict:
     res.setdefault("venue", venue)
     res.setdefault("symbol", symbol)
     res.setdefault("side", side)
-    # Attach observations for policy/logger insight
     if px == px:
         res.setdefault("price_usd", px)
     if quote_reserve_usd is not None:
@@ -487,12 +488,10 @@ def main():
     backoff = 2
     while True:
         try:
-            # Do NOT skip when EDGE_HOLD=true — still pull and ACK 'skipped'
             cmds = pull_once()
             if cmds:
                 _log(f"received {len(cmds)} command(s)")
 
-            # cache balances once per loop for reserve calc (avoid repeated exchange calls)
             balances_cache = get_balances()
 
             for cmd in cmds:
@@ -508,7 +507,6 @@ def main():
                     traceback.print_exc()
                     res = {"status":"error","message":str(e),"fills":[]}
 
-                # Normalize status & ACK
                 status_raw = (res.get("status") or "").lower()
                 status = "ok" if status_raw == "ok" else ("skipped" if status_raw in {"held","skipped"} else "error")
                 detail = {
@@ -522,7 +520,6 @@ def main():
                     "note": res.get("message", ""),
                     "ts": int(time.time()),
                 }
-                # Attach observations when present
                 if "price_usd" in res and res["price_usd"] is not None:
                     detail["price_usd"] = res["price_usd"]
                 if "quote_reserve_usd" in res and res["quote_reserve_usd"] is not None:
