@@ -483,6 +483,22 @@ def maybe_push_balances():
 # =========================
 # Main
 # =========================
+def wait_for_bus():
+    import time, requests, os
+    base = os.environ.get("BASE_URL")
+    for _ in range(60):   # up to ~2 minutes
+        try:
+            r = requests.get(f"{base}/healthz", timeout=5)
+            if r.ok:
+                return
+        except Exception:
+            pass
+        time.sleep(2)
+    _log("warning: bus warm-up timeout; continuing with backoff")
+
+# call once before main loop starts
+wait_for_bus()
+
 def main():
     _log(f"online — mode={EDGE_MODE} hold={EDGE_HOLD} base={BASE_URL} agent={AGENT_ID}")
     backoff = 2
