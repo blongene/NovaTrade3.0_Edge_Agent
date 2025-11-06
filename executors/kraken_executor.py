@@ -2,6 +2,7 @@
 # executors/kraken_executor.py — MARKET executor with BUY quote-guard, SELL clamp, provenance, and balance snapshots.
 import os, time, hmac, hashlib, base64, urllib.parse, requests
 from typing import Dict, Any
+from .kraken_util import to_kraken_altname
 
 BASE = os.getenv("KRAKEN_BASE_URL", "https://api.kraken.com").rstrip("/")
 KEY  = os.getenv("KRAKEN_KEY", "")
@@ -24,7 +25,13 @@ def _pair_info(pair: str) -> dict:
         return next(iter(j["result"].values()))
     except Exception:
         return {}
+        
+def get_price(session, symbol: str):
+    pair = to_kraken_altname(symbol)  
 
+def place_order(session, side: str, symbol: str, qty: float):
+    pair = to_kraken_altname(symbol)
+    
 def _ticker_price(pair: str) -> float:
     try:
         j = _public("/0/public/Ticker", {"pair": pair})
