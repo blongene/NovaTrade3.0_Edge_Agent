@@ -5,6 +5,7 @@
 from __future__ import annotations
 import os, time, json, hmac, hashlib, requests, re, traceback, collections, pathlib
 from typing import Dict, Any, Optional
+from edge_bus_poller import poll_once
 
 # =========================
 # Venue executors
@@ -41,6 +42,7 @@ EDGE_HOLD  = (os.getenv("EDGE_HOLD") or "false").strip().lower() in {"1","true",
 OUTBOX_SECRET    = (os.getenv("OUTBOX_SECRET") or os.getenv("EDGE_SECRET") or os.getenv("BUS_SECRET") or "").strip()
 TELEMETRY_SECRET = (os.getenv("TELEMETRY_SECRET") or OUTBOX_SECRET).strip()
 
+POLL_SEC         = int(os.getenv("EDGE_POLL_SECONDS", "30"))
 EDGE_POLL_SECS   = int(os.getenv("EDGE_POLL_SECS") or "8")
 LEASE_SECONDS    = int(os.getenv("LEASE_SECONDS") or "120")
 MAX_PULL         = int(os.getenv("MAX_CMDS_PER_PULL") or "5")
@@ -561,4 +563,12 @@ def main():
         time.sleep(EDGE_POLL_SECS if backoff <= 2 else backoff)
 
 if __name__ == "__main__":
-    main()
+    base = os.getenv("BASE_URL","")
+    aid  = os.getenv("AGENT_ID","edge-primary")
+    print(f"[edge] online — mode-{os.getenv('EDGE_MODE','dry')} hold-{os.getenv('EDGE_HOLD','false')} base={base} agent={aid}")
+    while True:
+        try:
+            poll_once()
+        except Exception as e:
+            print(f"[edge] loop error: {e}")
+        time.sleep(POLL_SEC)
