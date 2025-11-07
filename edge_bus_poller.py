@@ -25,7 +25,7 @@ from typing import Dict, Any
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:10000")
 AGENT_ID = os.getenv("AGENT_ID", "edge-primary")
-SECRET   = os.getenv("OUTBOX_SECRET", "")
+SECRET   = os.getenv("EDGE_SECRET", "")
 EDGE_MODE = os.getenv("EDGE_MODE", "dry").lower()
 EDGE_HOLD = os.getenv("EDGE_HOLD", "false").lower() in ("1","true","yes")
 
@@ -36,7 +36,6 @@ MAX_PULL = int(os.getenv("MAX_CMDS_PER_PULL", "5"))
 RECEIPTS_PATH = os.getenv("RECEIPTS_PATH", "./receipts.jsonl")
 
 def _raw_json(d: Dict[str, Any]) -> str:
-    """Compact JSON string used BOTH for HMAC and request body (no key sorting)."""
     return json.dumps(d, separators=(",", ":"))
 
 def _sign_raw(d: Dict[str, Any]) -> str:
@@ -46,12 +45,11 @@ def _sign_raw(d: Dict[str, Any]) -> str:
     return hmac.new(SECRET.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
 
 def _post(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    """POST to Bus using raw-bytes HMAC and X-Nova-Signature."""
-    raw = _raw_json(body)  # exact string we will send
+    raw = _raw_json(body)                  # exact string we will send
     sig = _sign_raw(body)
     headers = {
         "Content-Type": "application/json",
-        "X-Nova-Signature": sig,
+        "X-Nova-Signature": sig,          # header Bus verifies
     }
     r = requests.post(f"{BASE_URL}{path}", data=raw, headers=headers, timeout=15)
     r.raise_for_status()
@@ -116,22 +114,27 @@ def _exec_dry(venue: str, symbol: str, side: str, amount: float) -> Dict[str, An
     }
 
 # ---------- core loop ----------
-def _ack(command_id: str, status: str, detail: Dict[str, Any]):
-    body = {"agent_id": AGENT_ID, "command_id": command_id, "status": status, "detail": detail}
+def _ack(cmd_id: str, status: str, detail: Dict[str, Any]):
+    body = {
+        "agent_id": AGENT_ID,
+        "cmd_id": cmd_id,                 # <-- was command_id
+        "ok": (status == "ok"),           # <-- boolean ok
+        "receipt": detail,                # <-- attach details under "receipt"
+        "ts": int(time.time()),
+    }
     try:
         _post("/api/commands/ack", body)
     except Exception as e:
-        # Persist locally so we can reconcile later
-        _append_receipt({"command_id": command_id, "status": status, "detail": detail, "ack_error": str(e)})
+        _append_receipt({"cmd_id": cmd_id, "status": status, "detail": detail, "ack_error": str(e)})
         return
-    _append_receipt({"command_id": command_id, "status": status, "detail": detail})
-
+    _append_receipt({"cmd_id": cmd_id, "status": status, "detail": detail})
+  
 def _execute(cmd: Dict[str, Any]) -> None:
-    cid = cmd["id"]
-    pay = cmd["payload"]
-    venue  = pay.get("venue","").upper()
-    symbol = pay.get("symbol","").upper()
-    side   = pay.get("side","").lower()
+    cid = str(cmd["id"])
+    pay = cmd.get("intent") or cmd.get("payload") or {}   # <-- prefer 'intent'
+    venue  = (pay.get("venue") or "").upper()
+    symbol = (pay.get("symbol") or "").upper()
+    side   = (pay.get("side") or "").lower()
     amount = float(pay.get("amount", 0) or 0.0)
 
     # Idempotency: if we already acked ok before, skip
@@ -157,7 +160,7 @@ def _execute(cmd: Dict[str, Any]) -> None:
         _ack(cid, "error", {"error": str(e), "payload": pay})
 
 def poll_once():
-    body = {"agent_id": AGENT_ID, "max": MAX_PULL, "lease_seconds": LEASE_SECONDS}
+    body = {"agent_id": AGENT_ID, "limit": MAX_PULL, "ts": int(time.time())}
     try:
         res = _post("/api/commands/pull", body)
     except Exception as e:
@@ -172,9 +175,8 @@ def poll_once():
         try:
             _execute(c)
         except Exception as e:
-            # Defensive ack to avoid re-loops without detail
             try:
-                _ack(c.get("id","?"), "error", {"error": f"unhandled: {e}"})
+                _ack(str(c.get("id","?")), "error", {"error": f"unhandled: {e}"})
             except Exception:
                 pass
 
