@@ -35,22 +35,28 @@ MAX_PULL = int(os.getenv("MAX_CMDS_PER_PULL", "5"))
 
 RECEIPTS_PATH = os.getenv("RECEIPTS_PATH", "./receipts.jsonl")
 
-def _canonical(d: Dict[str, Any]) -> bytes:
-    return json.dumps(d, separators=(",",":"), sort_keys=True).encode("utf-8")
+def _raw_json(d: Dict[str, Any]) -> str:
+    """Compact JSON string used BOTH for HMAC and request body (no key sorting)."""
+    return json.dumps(d, separators=(",", ":"))
 
-def _sign(d: Dict[str, Any]) -> str:
+def _sign_raw(d: Dict[str, Any]) -> str:
     if not SECRET:
         return ""
-    return hmac.new(SECRET.encode("utf-8"), _canonical(d), hashlib.sha256).hexdigest()
+    raw = _raw_json(d)
+    return hmac.new(SECRET.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
 
 def _post(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    headers = {"Content-Type":"application/json"}
-    if SECRET:
-        headers["X-NT-Sig"] = _sign(body)
-    r = requests.post(f"{BASE_URL}{path}", json=body, headers=headers, timeout=15)
+    """POST to Bus using raw-bytes HMAC and X-Nova-Signature."""
+    raw = _raw_json(body)  # exact string we will send
+    sig = _sign_raw(body)
+    headers = {
+        "Content-Type": "application/json",
+        "X-Nova-Signature": sig,
+    }
+    r = requests.post(f"{BASE_URL}{path}", data=raw, headers=headers, timeout=15)
     r.raise_for_status()
     return r.json()
-
+  
 def _append_receipt(line: Dict[str, Any]) -> None:
     try:
         with open(RECEIPTS_PATH, "a", encoding="utf-8") as f:
