@@ -115,20 +115,31 @@ def _exec_dry(venue: str, symbol: str, side: str, amount: float) -> Dict[str, An
     }
 
 # ---------- core loop ----------
-def _ack(cmd_id: str, status: str, detail: Dict[str, Any]):
-    body = {
-        "agent_id": AGENT_ID,
-        "cmd_id": cmd_id,                 # <-- was command_id
-        "ok": (status == "ok"),           # <-- boolean ok
-        "receipt": detail,                # <-- attach details under "receipt"
-        "ts": int(time.time()),
+from edge_bus_client import ack
+
+def ack_success(agent_id: str, cmd_id: int | str, venue: str, symbol: str, side: str,
+                executed_qty: float, avg_price: float, extras: dict | None = None):
+    receipt = {
+        "normalized": {
+            "receipt_id": f"{agent_id}:{cmd_id}",
+            "venue": venue,
+            "symbol": symbol,
+            "side": side,
+            "executed_qty": executed_qty,
+            "avg_price": avg_price,
+            "status": "FILLED",
+        }
     }
-    try:
-        _post("/api/commands/ack", body)
-    except Exception as e:
-        _append_receipt({"cmd_id": cmd_id, "status": status, "detail": detail, "ack_error": str(e)})
-        return
-    _append_receipt({"cmd_id": cmd_id, "status": status, "detail": detail})
+    if extras:  # fee, order_id, txid, quote_spent, etc.
+        receipt["normalized"].update(extras)
+    return ack(agent_id, cmd_id, True, receipt)
+
+def ack_error(agent_id: str, cmd_id: int | str, message: str, extras: dict | None = None):
+    receipt = {"error": message}
+    if extras:
+        receipt.update(extras)
+    return ack(agent_id, cmd_id, False, receipt)
+
   
 def poll_once():
     if EDGE_HOLD:
@@ -156,12 +167,12 @@ def poll_once():
                 pass
 
 def _execute(cmd: Dict[str, Any]) -> None:
-    cid = str(cmd["id"])
-    intent = cmd.get("intent") or {}
-    venue  = (intent.get("venue")  or "").upper()
+    cid = cmd["id"]
+    intent = cmd.get("intent", {})
+    venue  = (intent.get("venue") or "").upper()
     symbol = (intent.get("symbol") or "").upper()
-    side   = (intent.get("side")   or "").lower()
-    amount = float(intent.get("amount", 0) or 0.0)
+    side   = (intent.get("side") or "").lower()
+    amount = float(intent.get("amount") or 0.0)
 
     # … call your venue executor(s) here …
     # detail should be a dict with normalized receipt:
@@ -176,7 +187,10 @@ def _execute(cmd: Dict[str, Any]) -> None:
     }}
 
     ok = True
-    ack(AGENT_ID, cid, ok, detail)
+    ack_success(AGENT_ID, cid, venue, symbol, side, executed_qty=amount, avg_price=price, extras={"order_id": oid})
+
+    # On error:
+    ack_error(AGENT_ID, cid, f"price fetch failed: {err}", {"venue": venue, "symbol": symbol})
 
 def run_forever():
     print(f"[edge] bus poller online — agent={AGENT_ID} mode={EDGE_MODE} hold={EDGE_HOLD} base={BASE_URL}")
