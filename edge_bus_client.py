@@ -1,5 +1,6 @@
-# edge_bus_client.py — canonical Bus client (raw-bytes HMAC)
+# edge_bus_client.py — canonical Bus client for Edge (raw-bytes HMAC)
 import os, json, hmac, hashlib, requests, time
+
 BASE_URL = os.getenv("BASE_URL", "")
 EDGE_SECRET = os.getenv("EDGE_SECRET", "")
 
@@ -18,10 +19,7 @@ def post_signed(path: str, body: dict, timeout: int = 15) -> requests.Response:
     return requests.post(
         f"{BASE_URL}{path}",
         data=raw,
-        headers={
-            "Content-Type": "application/json",
-            "X-Nova-Signature": sig,
-        },
+        headers={"Content-Type": "application/json", "X-Nova-Signature": sig},
         timeout=timeout,
     )
 
