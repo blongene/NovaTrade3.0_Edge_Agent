@@ -22,6 +22,7 @@ Environment (Edge worker):
 
 import os, time, json, hmac, hashlib, requests, threading
 from typing import Dict, Any
+from edge_bus_client import pull, ack
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:10000")
 AGENT_ID = os.getenv("AGENT_ID", "edge-primary")
@@ -31,7 +32,7 @@ EDGE_HOLD = os.getenv("EDGE_HOLD", "false").lower() in ("1","true","yes")
 
 PULL_PERIOD = int(os.getenv("PULL_PERIOD_SECONDS", "8"))
 LEASE_SECONDS = int(os.getenv("LEASE_SECONDS", "90"))
-MAX_PULL = int(os.getenv("MAX_CMDS_PER_PULL", "5"))
+MAX_PULL = int(os.getenv("EDGE_PULL_LIMIT", "3"))
 
 RECEIPTS_PATH = os.getenv("RECEIPTS_PATH", "./receipts.jsonl")
 
@@ -129,45 +130,17 @@ def _ack(cmd_id: str, status: str, detail: Dict[str, Any]):
         return
     _append_receipt({"cmd_id": cmd_id, "status": status, "detail": detail})
   
-def _execute(cmd: Dict[str, Any]) -> None:
-    cid = str(cmd["id"])
-    pay = cmd.get("intent") or cmd.get("payload") or {}   # <-- prefer 'intent'
-    venue  = (pay.get("venue") or "").upper()
-    symbol = (pay.get("symbol") or "").upper()
-    side   = (pay.get("side") or "").lower()
-    amount = float(pay.get("amount", 0) or 0.0)
-
-    # Idempotency: if we already acked ok before, skip
-    if _seen_ok(cid):
-        _ack(cid, "skipped", {"reason":"duplicate (already ok)"})
-        return
-
-    if EDGE_HOLD:
-        _ack(cid, "skipped", {"reason":"EDGE_HOLD"})
-        return
-
-    if amount <= 0 or side not in ("buy","sell") or not venue or not symbol:
-        _ack(cid, "error", {"error":"invalid payload", "payload": pay})
-        return
-
-    try:
-        if EDGE_MODE == "live":
-            detail = _exec_live(venue, symbol, side, amount)
-        else:
-            detail = _exec_dry(venue, symbol, side, amount)
-        _ack(cid, "ok", detail)
-    except Exception as e:
-        _ack(cid, "error", {"error": str(e), "payload": pay})
-
 def poll_once():
-    body = {"agent_id": AGENT_ID, "limit": MAX_PULL, "ts": int(time.time())}
+    if EDGE_HOLD:
+        print("[edge] hold=True; skipping poll")
+        return
     try:
-        res = _post("/api/commands/pull", body)
+        res = pull(AGENT_ID, MAX_PULL)
     except Exception as e:
         print(f"[edge] pull error: {e}")
         return
 
-    cmds = (res or {}).get("commands", [])
+    cmds: List[Dict[str, Any]] = (res or {}).get("commands") or []
     if not cmds:
         return
     print(f"[edge] received {len(cmds)} command(s)")
@@ -175,10 +148,35 @@ def poll_once():
         try:
             _execute(c)
         except Exception as e:
+            cid = str(c.get("id", "?"))
+            tb = "".join(traceback.format_exception_only(type(e), e)).strip()
             try:
-                _ack(str(c.get("id","?")), "error", {"error": f"unhandled: {e}"})
+                ack(AGENT_ID, cid, False, {"error": f"unhandled: {tb}"})
             except Exception:
                 pass
+
+def _execute(cmd: Dict[str, Any]) -> None:
+    cid = str(cmd["id"])
+    intent = cmd.get("intent") or {}
+    venue  = (intent.get("venue")  or "").upper()
+    symbol = (intent.get("symbol") or "").upper()
+    side   = (intent.get("side")   or "").lower()
+    amount = float(intent.get("amount", 0) or 0.0)
+
+    # … call your venue executor(s) here …
+    # detail should be a dict with normalized receipt:
+    detail = {"normalized":{
+        "receipt_id": f"{AGENT_ID}:{cid}",
+        "venue": venue,
+        "symbol": symbol,
+        "side": side,
+        "executed_qty": amount,
+        "avg_price": 0.0,   # fill from executor
+        "status": "FILLED" if EDGE_MODE=="live" else "SIMULATED",
+    }}
+
+    ok = True
+    ack(AGENT_ID, cid, ok, detail)
 
 def run_forever():
     print(f"[edge] bus poller online — agent={AGENT_ID} mode={EDGE_MODE} hold={EDGE_HOLD} base={BASE_URL}")
