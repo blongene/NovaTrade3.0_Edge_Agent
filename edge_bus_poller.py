@@ -22,7 +22,6 @@ Environment (Edge worker):
 
 import os, time, json, hmac, hashlib, requests, threading
 from typing import Dict, Any
-from edge_bus_client import pull, ack
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:10000")
 AGENT_ID = os.getenv("AGENT_ID", "edge-primary")
@@ -115,7 +114,12 @@ def _exec_dry(venue: str, symbol: str, side: str, amount: float) -> Dict[str, An
     }
 
 # ---------- core loop ----------
-from edge_bus_client import ack
+from edge_bus_client import pull, ack
+
+res = pull(AGENT_ID, MAX_PULL)
+for cmd in res.get("commands", []):
+    # ... compute ok, receipt ...
+    ack(AGENT_ID, cmd["id"], ok, receipt)
 
 def ack_success(agent_id: str, cmd_id: int | str, venue: str, symbol: str, side: str,
                 executed_qty: float, avg_price: float, extras: dict | None = None):
