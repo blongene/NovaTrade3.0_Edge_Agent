@@ -48,3 +48,36 @@ def execute(cmd: Dict[str, Any]) -> Dict[str, Any]:
         return _as_ok(kraken_exec(cmd))
 
     return {"status": "error", "message": f"unknown or disabled venue: {venue}", "fills": []}
+
+# broker_router.py
+def route(order: dict):
+    """
+    Returns (ok: bool, receipt: dict).
+    Receipt is safe to embed under the 'receipt' key for /api/commands/ack.
+    """
+    venue = (order.get("venue") or "").upper()
+    symbol = (order.get("symbol") or "").upper()
+    side   = (order.get("side") or "").lower()
+    amount = float(order.get("amount") or 0)
+
+    if amount <= 0:
+        return False, {"error": "amount/quote_amount must be > 0", "applied": order}
+
+    # ... dispatch to venue executor, get `r` back (may have local 'status' strings) ...
+    ok = (r is True) or (isinstance(r, dict) and (r.get("ok") is True or r.get("status") in {"ok", "filled", "✅ Executed"}))
+
+    normalized = {
+        "normalized": {
+            "venue": venue,
+            "symbol": symbol,
+            "side": side,
+            "executed_qty": amount if ok else 0.0,
+            "avg_price": float(r.get("avg_price", 0.0)) if isinstance(r, dict) else 0.0,
+            "status": "FILLED" if ok else "ERROR",
+        },
+        "raw": r,  # keep raw for debugging
+    }
+    if not ok:
+        normalized["error"] = (r.get("message") or r.get("error") or "unknown") if isinstance(r, dict) else str(r)
+
+    return ok, normalized
