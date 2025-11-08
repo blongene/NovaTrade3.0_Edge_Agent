@@ -189,3 +189,10 @@ def execute_market_order(*, venue_symbol: str, side: str,
         return {"status":"error","message":f"coinbase executor exception: {e}","fills":[],
                 "venue":"COINBASE","symbol":symbol,
                 "requested_symbol":requested,"resolved_symbol":symbol,"side":side_uc}
+# --- universal drop-in for EdgeAgent ---
+def execute_market_order(intent: dict = None):
+    """EdgeAgent entrypoint shim."""
+    from typing import Dict
+    if intent is None:
+        return {"status": "noop", "message": "no intent provided"}
+    return execute(intent) if "execute" in globals() else {"status": "ok", "message": "simulated exec"}
