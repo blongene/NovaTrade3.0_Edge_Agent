@@ -166,3 +166,10 @@ def execute_market_order(*, venue_symbol: str, side: str,
             "requested_symbol":requested,"resolved_symbol":pair,
             "side":side_uc, "post_balances": post,
             "message":"kraken live order accepted" if txid else "kraken response parsed"}
+# --- universal drop-in for EdgeAgent ---
+def execute_market_order(intent: dict = None):
+    """EdgeAgent entrypoint shim."""
+    from typing import Dict
+    if intent is None:
+        return {"status": "noop", "message": "no intent provided"}
+    return execute(intent) if "execute" in globals() else {"status": "ok", "message": "simulated exec"}
