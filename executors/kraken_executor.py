@@ -10,9 +10,12 @@ SEC  = os.getenv("KRAKEN_SECRET", "")  # base64 Kraken secret
 TIMEOUT = int(os.getenv("KRAKEN_TIMEOUT_S", "15"))
 
 def _sym(venue_symbol: str) -> str:
-    # BTC/USDT -> XBTUSDT (Kraken uses XBT)
+    # Map common base codes to Kraken codes, strip slash
     s = (venue_symbol or "BTC/USDT").upper().replace("/", "")
-    return s.replace("BTC", "XBT")
+    # BTC -> XBT (only the base)
+    if s.startswith("BTC"):
+        s = "XBT" + s[3:]
+    return s
 
 def _public(path, params=None):
     r = requests.get(f"{BASE}{path}", params=params or {}, timeout=TIMEOUT)
