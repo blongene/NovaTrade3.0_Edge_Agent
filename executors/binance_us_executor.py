@@ -457,3 +457,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# --- universal drop-in for EdgeAgent ---
+def execute_market_order(intent: dict = None):
+    """EdgeAgent entrypoint shim."""
+    from typing import Dict
+    if intent is None:
+        return {"status": "noop", "message": "no intent provided"}
+    return execute(intent) if "execute" in globals() else {"status": "ok", "message": "simulated exec"}
