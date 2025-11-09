@@ -116,10 +116,12 @@ def _exec_dry(venue: str, symbol: str, side: str, amount: float) -> Dict[str, An
 # ---------- core loop ----------
 from edge_bus_client import pull, ack
 
-res = pull(AGENT_ID, MAX_PULL)
-for cmd in res.get("commands", []):
-    # ... compute ok, receipt ...
-    ack(AGENT_ID, cmd["id"], ok, receipt)
+res = pull(AGENT_ID, 1)
+cmds = (res or {}).get("commands") or []
+if not cmds:
+    # nothing leased (or transient error) – just sleep and loop
+    time.sleep(POLL_SECS)
+    continue
 
 def ack_success(agent_id: str, cmd_id: int | str, venue: str, symbol: str, side: str,
                 executed_qty: float, avg_price: float, extras: dict | None = None):
