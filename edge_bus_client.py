@@ -1,34 +1,60 @@
+# edge_bus_client.py
 import os, json, hmac, hashlib, requests, time, random
 
-BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
-SECRET   = os.environ.get("EDGE_SECRET", "")
-TIMEOUT  = float(os.environ.get("EDGE_HTTP_TIMEOUT_SECS", "12"))  # connect/read
-RETRIES  = int(os.environ.get("EDGE_HTTP_RETRIES", "4"))          # attempts total
-BACKOFF0 = float(os.environ.get("EDGE_HTTP_BACKOFF_SECS", "0.6")) # base backoff
-
+# --------------------------------------------------------------------
+# Config (all overridable via env)
+# --------------------------------------------------------------------
 def _base_url() -> str:
-    base = os.getenv("BASE_URL","").strip()
+    base = os.getenv("BASE_URL", "").strip()
     if not (base.startswith("http://") or base.startswith("https://")):
         raise RuntimeError(f"BASE_URL missing or invalid: {base!r}")
     return base.rstrip("/")
 
-EDGE_SECRET = os.getenv("EDGE_SECRET","")
+BASE_URL = _base_url()                                  # validated
+EDGE_SECRET = os.environ.get("EDGE_SECRET", "").strip() # required for HMAC
+if not EDGE_SECRET:
+    raise RuntimeError("EDGE_SECRET is not set")
 
-def _raw(d: dict) -> str:
-    return json.dumps(d, separators=(",",":"))
+# timeouts/backoff
+TIMEOUT  = float(os.environ.get("EDGE_HTTP_TIMEOUT_SECS", "12"))   # seconds (connect/read)
+RETRIES  = int(os.environ.get("EDGE_HTTP_RETRIES", "4"))           # total attempts
+BACKOFF0 = float(os.environ.get("EDGE_HTTP_BACKOFF_SECS", "0.6"))  # base backoff
 
-def _sign_raw(d: dict) -> str:
-    raw = _raw(d)
-    return hmac.new(EDGE_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
+# --------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------
+def _canonical_json(d: dict) -> str:
+    # match Bus HMAC expectations
+    return json.dumps(d, separators=(",", ":"), sort_keys=True)
 
-def _sign(raw: str) -> str:
-    return hmac.new(SECRET.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
+def _sign_raw(raw: str) -> str:
+    return hmac.new(EDGE_SECRET.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
 
-def post_signed(path: str, body: dict, timeout: float | tuple = None) -> requests.Response:
-    """Signed POST with automatic retries on 5xx and connection issues."""
+def _retryable_status(code: int) -> bool:
+    # retry on 5xx + 429
+    return code == 429 or (500 <= code < 600)
+
+def _short_html(text: str, limit: int = 160) -> str:
+    # Collapse giant HTML error pages into a short single-line hint
+    t = text.strip()
+    if t.startswith("<!DOCTYPE") or t.startswith("<html"):
+        return "HTML error page (e.g., 502)"
+    if len(t) > limit:
+        return t[:limit] + "…"
+    return t
+
+# --------------------------------------------------------------------
+# Core signed POST with retries
+# --------------------------------------------------------------------
+def post_signed(path: str, body: dict, timeout: float | tuple | None = None) -> requests.Response:
+    """
+    Signed POST with automatic retries on 5xx/429 and connection issues.
+    Raises an HTTPError/ConnectionError/Timeout if all retries fail.
+    """
     url = f"{BASE_URL}{path}"
-    raw = json.dumps(body, separators=(",", ":"), sort_keys=True)
-    sig = _sign(raw)
+    raw = _canonical_json(body)
+    sig = _sign_raw(raw)
+
     headers = {
         "Content-Type": "application/json",
         "X-Nova-Signature": sig,
@@ -36,26 +62,32 @@ def post_signed(path: str, body: dict, timeout: float | tuple = None) -> request
     if timeout is None:
         timeout = (TIMEOUT, TIMEOUT)  # (connect, read)
 
-    last_exc = None
+    last_exc: Exception | None = None
+
     for attempt in range(1, RETRIES + 1):
         try:
             r = requests.post(url, data=raw, headers=headers, timeout=timeout)
-            # Fast-fail on auth problems; retry only 5xx and gateway errors
-            if 500 <= r.status_code < 600 or r.status_code in (429,):
-                # transient – retry
-                pass
+            if _retryable_status(r.status_code):
+                # fall through to backoff/retry
+                last_exc = requests.HTTPError(
+                    f"{r.status_code} {_short_html(r.text)}", response=r
+                )
             else:
                 r.raise_for_status()
                 return r
+
         except (requests.Timeout, requests.ConnectionError) as e:
             last_exc = e
+
         except requests.HTTPError as e:
-            # if not a retryable code, bubble immediately
-            if not (500 <= e.response.status_code < 600 or e.response.status_code == 429):
+            # If not retryable, bubble immediately
+            resp = getattr(e, "response", None)
+            code = getattr(resp, "status_code", None)
+            if code is None or not _retryable_status(code):
                 raise
             last_exc = e
 
-        # Backoff with jitter
+        # jittered exponential backoff
         sleep_s = BACKOFF0 * (2 ** (attempt - 1))
         sleep_s += random.uniform(0, 0.25)
         time.sleep(min(sleep_s, 6.0))
@@ -65,23 +97,30 @@ def post_signed(path: str, body: dict, timeout: float | tuple = None) -> request
         raise last_exc
     raise RuntimeError("post_signed failed without exception")
 
+# --------------------------------------------------------------------
+# Edge Bus convenience functions
+# --------------------------------------------------------------------
 def pull(agent_id: str, limit: int = 1) -> dict:
+    """Lease up to `limit` commands for this agent."""
     body = {"agent_id": agent_id, "limit": int(limit), "ts": int(time.time())}
     try:
         r = post_signed("/api/commands/pull", body)
         return r.json()
     except Exception as e:
         # Don’t crash the loop – surface a clean, single-line message
-        print(f"[edge] ERROR pull error: {e}")
-        return {"ok": False, "commands": [], "error": str(e)}
+        msg = getattr(e, "args", [str(e)])[0]
+        print(f"[edge] ERROR pull error: {msg}")
+        return {"ok": False, "commands": [], "error": msg}
 
 def ack(agent_id: str, cmd_id: int | str, ok: bool, receipt: dict) -> dict:
-    body = {"agent_id": agent_id, "cmd_id": cmd_id, "ok": ok, "receipt": receipt, "ts": int(time.time())}
-    r = post_signed("/api/commands/ack", body); r.raise_for_status(); return r.json()
-
-def _base_url() -> str:
-    base = os.getenv("BASE_URL", "").strip()
-    if not (base.startswith("http://") or base.startswith("https://")):
-        raise RuntimeError(f"BASE_URL missing or invalid: {base!r}")
-    return base.rstrip("/")
-
+    """Acknowledge (and finalize if ok=True) a leased command with a normalized receipt."""
+    body = {
+        "agent_id": agent_id,
+        "cmd_id": cmd_id,
+        "ok": bool(ok),
+        "receipt": receipt or {},
+        "ts": int(time.time()),
+    }
+    r = post_signed("/api/commands/ack", body)
+    r.raise_for_status()
+    return r.json()
