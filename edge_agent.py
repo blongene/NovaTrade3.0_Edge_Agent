@@ -221,8 +221,9 @@ def main():
                     }
                 }
                 bus_ack(cid, False, fail)
-
         # Immediately loop; the Bus controls lease cadence
+from telemetry_sender import start_balance_pusher
+start_balance_pusher()
 
 if __name__ == "__main__":
     main()
