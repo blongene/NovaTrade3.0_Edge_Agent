@@ -38,13 +38,53 @@ def _save_cache(obj: dict):
         pass
 
 def _collect_balances() -> dict:
-    """Replace with your real balance collector; this is a simple stub."""
-    # expected shape: {agent, by_venue, flat, ts}
+    """
+    Uses existing Edge executors to collect balances:
+      - executors.coinbase_advanced_executor.CoinbaseCDP().balances()  -> {asset: available}
+      - executors.binance_us_executor.get_balances()                   -> {"COINBASE": {...}, "BINANCEUS": {...}}
+    Returns the Bus-friendly shape:
+      {agent, by_venue: {VENUE:{USD:..,USDC:..,USDT:..}}, flat:{BTC:..,ETH:..,...}, ts}
+    """
     agent = os.getenv("EDGE_AGENT_ID") or os.getenv("AGENT_ID") or "edge"
-    # TODO: wire your actual venue balances here
-    by_venue = {}  # e.g., {"COINBASE":{"USD":123.45}, "BINANCEUS":{"USDT":456.78}}
-    flat = {}      # e.g., {"BTC": 0.12, "ETH": 1.0}
     ts = int(time.time())
+
+    # --- pull the venue->asset balances (dict[str, dict[str,float]])
+    by_venue_raw: dict[str, dict] = {}
+    try:
+        # Preferred: module that already gathers both venues
+        from executors.binance_us_executor import get_balances as _edge_get_balances  # type: ignore
+        by_venue_raw = _edge_get_balances() or {}
+    except Exception as e:
+        # Fallback: try coinbase directly if available, and leave binance out
+        try:
+            from executors.coinbase_advanced_executor import CoinbaseCDP  # type: ignore
+            by_venue_raw["COINBASE"] = CoinbaseCDP().balances()
+        except Exception:
+            pass
+
+    # --- normalize into by_venue (only quote assets) and flat (sum of base assets across venues)
+    quotes = ("USD", "USDC", "USDT")
+    by_venue: dict[str, dict[str, float]] = {}
+    flat: dict[str, float] = {}
+
+    for venue, assets in (by_venue_raw or {}).items():
+        if not isinstance(assets, dict):
+            continue
+        vkey = (venue or "").upper()
+        v_out: dict[str, float] = {}
+        for asset, amt in assets.items():
+            try:
+                a = (asset or "").upper()
+                x = float(amt or 0.0)
+            except Exception:
+                continue
+            if a in quotes:
+                v_out[a] = v_out.get(a, 0.0) + x
+            else:
+                flat[a] = flat.get(a, 0.0) + x
+        if v_out:
+            by_venue[vkey] = v_out
+
     return {"agent": agent, "by_venue": by_venue, "flat": flat, "ts": ts}
 
 def push_balances_once(use_cache_if_empty=True) -> bool:
