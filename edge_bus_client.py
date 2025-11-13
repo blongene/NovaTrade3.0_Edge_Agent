@@ -1,5 +1,6 @@
 # edge_bus_client.py
 import os, json, hmac, hashlib, requests, time, random
+_last_pull_log_ts = 0.0  # rate-limit noisy transient errors
 
 # --------------------------------------------------------------------
 # Config (all overridable via env)
@@ -102,14 +103,28 @@ def post_signed(path: str, body: dict, timeout: float | tuple | None = None) -> 
 # --------------------------------------------------------------------
 def pull(agent_id: str, limit: int = 1) -> dict:
     """Lease up to `limit` commands for this agent."""
+    global _last_pull_log_ts
+
     body = {"agent_id": agent_id, "limit": int(limit), "ts": int(time.time())}
     try:
         r = post_signed("/api/commands/pull", body)
         return r.json()
     except Exception as e:
-        # Don’t crash the loop – surface a clean, single-line message
+        # Don’t crash the loop – surface a clean, rate-limited message
         msg = getattr(e, "args", [str(e)])[0]
-        print(f"[edge] ERROR pull error: {msg}")
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        now = time.time()
+
+        # Treat 5xx/HTML “502” pages as transient – log at most once per minute
+        transient = (code in (502, 503, 504)) or ("HTML error page" in str(msg)) or ("<!DOCTYPE" in str(msg))
+        if transient:
+            if now - _last_pull_log_ts > 60:
+                print(f"[edge] WARN pull transient {code or ''}: {msg}")
+                _last_pull_log_ts = now
+        else:
+            # real errors (auth, 4xx) should still be loud
+            print(f"[edge] ERROR pull error: {msg}")
+
         return {"ok": False, "commands": [], "error": msg}
 
 def ack(agent_id: str, cmd_id: int | str, ok: bool, receipt: dict) -> dict:
