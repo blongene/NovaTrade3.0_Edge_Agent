@@ -85,19 +85,19 @@ def _exec_live(venue: str, symbol: str, side: str, amount: float) -> Dict[str, A
     """
     venue = venue.upper()
     try:
-        if venue == "KRAKEN":
-            # from kraken_executor import place_order
-            # oid = place_order(symbol, side, amount)
-            oid = f"kraken-{int(time.time())}"
-            return {"venue":"KRAKEN","order_id":oid,"symbol":symbol,"side":side,"amount":amount}
+        if venue == "BINANCEUS":
+            # from binanceus_executor import place_order
+            oid = f"binanceus-{int(time.time())}"
+            return {"venue":"BINANCEUS","order_id":oid,"symbol":symbol,"side":side,"amount":amount}
         elif venue == "COINBASE":
             # from coinbase_executor import place_order
             oid = f"coinbase-{int(time.time())}"
             return {"venue":"COINBASE","order_id":oid,"symbol":symbol,"side":side,"amount":amount}
-        elif venue == "BINANCEUS":
-            # from binanceus_executor import place_order
-            oid = f"binanceus-{int(time.time())}"
-            return {"venue":"BINANCEUS","order_id":oid,"symbol":symbol,"side":side,"amount":amount}
+        elif venue == "KRAKEN":
+            # from kraken_executor import place_order
+            # oid = place_order(symbol, side, amount)
+            oid = f"kraken-{int(time.time())}"
+            return {"venue":"KRAKEN","order_id":oid,"symbol":symbol,"side":side,"amount":amount}
         else:
             raise RuntimeError(f"unknown venue {venue}")
     except Exception as e:
