@@ -200,10 +200,24 @@ def main():
             continue
 
         for cmd in cmds:
-            cid    = cmd.get("id")
-            intent = cmd.get("intent", {})
+            cid = cmd.get("id")
+
+            # 🔹 Unwrap envelope from Bus → Edge
+            intent = cmd.get("intent")
+            if not intent:
+                envelope = cmd.get("payload") or {}
+                if isinstance(envelope, dict):
+                    # New-style: {agent_id, type, payload={...}} or {agent_id, type, intent={...}}
+                    intent = (
+                        envelope.get("intent")
+                        or envelope.get("payload")
+                        or envelope
+                    )
+                else:
+                    intent = {}
+
             try:
-                res = execute_intent(intent)
+                res = execute_intent(intent or {})
                 log.info(f"ack cmd={cid} ok=True")
                 bus_ack(cid, True, res)
             except Exception as e:
@@ -221,6 +235,7 @@ def main():
                     }
                 }
                 bus_ack(cid, False, fail)
+
         # Immediately loop; the Bus controls lease cadence
 from telemetry_sender import start_balance_pusher
 start_balance_pusher()
