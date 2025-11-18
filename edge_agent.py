@@ -202,45 +202,35 @@ def main():
         for cmd in cmds:
             cid = cmd.get("id")
 
-            # 🔹 Unwrap envelope from Bus → Edge
-            intent = cmd.get("intent")
+            # The Bus returns rows like:
+            # { "id": 14, "ts": ..., "payload": { "agent_id": ..., "type": ..., "payload": { ...intent... } } }
             envelope = cmd.get("payload") or {}
+            if not isinstance(envelope, dict):
+                envelope = {}
 
-            if not intent:
-                if isinstance(envelope, dict):
-                    # New-style: {agent_id, type, payload={...}} or {agent_id, type, intent={...}}
-                    inner = envelope.get("intent") or envelope.get("payload")
-                    if isinstance(inner, dict):
-                        intent = inner
-                    else:
-                        intent = envelope
-                else:
-                    intent = {}
-
+            # Intent is inside envelope["payload"] (or "intent" for future variants)
+            intent = envelope.get("payload") or envelope.get("intent") or {}
             if not isinstance(intent, dict):
                 intent = {}
 
-            # Light-touch logging so we can see what the Edge thinks it's executing
-            env_agent = ""
-            env_type  = ""
-            if isinstance(envelope, dict):
-                env_agent = envelope.get("agent_id") or envelope.get("agent") or ""
-                env_type  = envelope.get("type") or ""
+            # For debugging: what does the Edge think it is executing?
+            env_agent = envelope.get("agent_id", "")
+            env_type  = envelope.get("type", "")
+            venue     = intent.get("venue", "")
+            symbol    = intent.get("symbol", "")
 
-            venue  = (intent or {}).get("venue", "")
-            symbol = (intent or {}).get("symbol", "")
             log.info(
                 f"exec cmd={cid} agent={env_agent} type={env_type} venue={venue} symbol={symbol}"
             )
 
             try:
-                res = execute_intent(intent or {})
+                res = execute_intent(intent)
                 log.info(f"ack cmd={cid} ok=True")
                 bus_ack(cid, True, res)
             except Exception as e:
                 # best-effort failure receipt
-                venue  = (intent or {}).get("venue", "") or venue
-                symbol = (intent or {}).get("symbol", "") or symbol
+                venue  = intent.get("venue", "") or venue
+                symbol = intent.get("symbol", "") or symbol
                 log.error(f"executor error {venue}: {e}", exc_info=True)
                 fail = {
                     "normalized": {
@@ -252,6 +242,7 @@ def main():
                     }
                 }
                 bus_ack(cid, False, fail)
+
         # Immediately loop; the Bus controls lease cadence
 
 from telemetry_sender import start_balance_pusher
