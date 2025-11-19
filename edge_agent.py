@@ -56,23 +56,19 @@ def _hmac_sha256_hex(key: str, raw: bytes) -> str:
 
 
 def _post_json(path: str, body: Dict[str, Any]) -> Any:
-    """
-    POST signed JSON to the bus.
-
-    Bus /api/commands/* endpoints expect header:
-        X-OUTBOX-SIGN = HMAC_SHA256(OUTBOX_SECRET, raw_body_bytes)
-
-    We reuse EDGE_SECRET for this; in the Bus env, OUTBOX_SECRET should match.
-    """
     raw = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
     sig = _hmac_sha256_hex(EDGE_SECRET, raw)
 
     url = f"{BASE_URL}{path}"
-    headers: Dict[str, str] = {
+    headers = {
         "Content-Type": "application/json",
     }
     if sig:
-        headers["X-OUTBOX-SIGN"] = sig
+        # Must match ops_api_sqlite.py header_name exactly
+        headers["X-Outbox-Signature"] = sig
+
+    r = requests.post(url, data=raw, headers=headers, timeout=TIMEOUT)
+    ...
 
     r = requests.post(url, data=raw, headers=headers, timeout=TIMEOUT)
     if r.status_code >= 400:
