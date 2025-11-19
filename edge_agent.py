@@ -56,6 +56,12 @@ def _hmac_sha256_hex(key: str, raw: bytes) -> str:
 
 
 def _post_json(path: str, body: Dict[str, Any]) -> Any:
+    """
+    POST signed JSON to the bus.
+
+    We compute one HMAC and send it under all expected headers so any of the
+    Bus verifiers (edge / outbox / telemetry) will accept it.
+    """
     raw = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
     sig = _hmac_sha256_hex(EDGE_SECRET, raw)
 
@@ -64,21 +70,18 @@ def _post_json(path: str, body: Dict[str, Any]) -> Any:
         "Content-Type": "application/json",
     }
     if sig:
-        # Must match ops_api_sqlite.py header_name exactly
-        headers["X-Outbox-Signature"] = sig
-
-    r = requests.post(url, data=raw, headers=headers, timeout=TIMEOUT)
-    ...
+        # Belt-and-suspenders: support all existing verifiers on the Bus
+        headers["X-OUTBOX-SIGN"]    = sig
+        headers["X-EDGE-SIGN"]      = sig
+        headers["X-TELEMETRY-SIGN"] = sig
 
     r = requests.post(url, data=raw, headers=headers, timeout=TIMEOUT)
     if r.status_code >= 400:
         raise requests.HTTPError(f"{r.status_code} {r.text}")
-    # Some endpoints return plain values, so guard json()
     try:
         return r.json()
     except Exception:
         return None
-
 
 def bus_pull(lease_limit: int = 1) -> Any:
     """
