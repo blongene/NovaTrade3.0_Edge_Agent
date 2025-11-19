@@ -1,252 +1,389 @@
 #!/usr/bin/env python3
-# edge_agent.py — minimal, robust Edge that leases, executes, and ACKs
+"""
+NovaTrade 3.0 Edge Agent (unified, HMAC-signed)
 
-import os, time, json, hmac, hashlib, logging, importlib, inspect
-from typing import Any, Dict, Optional
+- Long-polls the Bus /api/commands/pull endpoint for commands.
+- Executes trading intents on venue-specific executors.
+- ACKs results (or errors/holds) back to /api/commands/ack.
+- Pushes balance telemetry in a background thread.
 
+This file is a DROP-IN replacement for edge_agent.py.
+"""
+
+import json
+import logging
+import os
+import time
+import hmac
+import hashlib
+from typing import Any, Dict, List, Optional
+
+import importlib
 import requests
 
-# ---------- Config / ENV ----------
-BASE_URL     = os.getenv("BASE_URL", "").rstrip("/")
-AGENT_ID     = os.getenv("AGENT_ID", "edge-primary")
-EDGE_SECRET  = os.getenv("EDGE_SECRET", "")
-EDGE_MODE    = os.getenv("EDGE_MODE", "live")  # live|dry
-EDGE_HOLD    = os.getenv("EDGE_HOLD", "false").lower() == "true"
-POLL_SECS    = int(os.getenv("EDGE_POLL_SECS", "60"))
-TIMEOUT      = int(os.getenv("EDGE_HTTP_TIMEOUT", "15"))
+from telemetry_sender import start_balance_pusher  # existing helper
+
+# ---------- Config ----------
+
+BASE_URL = (
+    (os.getenv("CLOUD_BASE_URL") or os.getenv("BASE_URL") or "").rstrip("/")
+    or "https://novatrade3-0.onrender.com"
+)
+EDGE_SECRET = os.getenv("EDGE_SECRET", "")
+AGENT_ID    = os.getenv("AGENT_ID", "edge-primary")
+
+EDGE_MODE = os.getenv("EDGE_MODE", "live").lower()   # "live" or "dryrun"
+EDGE_HOLD = os.getenv("EDGE_HOLD", "false").lower() == "true"
+
+POLL_SECS = float(os.getenv("EDGE_POLL_SECS", "5"))
+TIMEOUT   = float(os.getenv("EDGE_HTTP_TIMEOUT", "15"))
+
+LOG_LEVEL = os.getenv("EDGE_LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="[edge] %(levelname)s %(asctime)s %(message)s",
 )
 log = logging.getLogger("edge")
 
-if not BASE_URL or not EDGE_SECRET:
-    raise SystemExit("BASE_URL and EDGE_SECRET must be set")
 
-# ---------- HTTP helpers (HMAC) ----------
-def _hmac_sha256(secret: str, raw: str) -> str:
-    return hmac.new(secret.encode(), raw.encode(), hashlib.sha256).hexdigest()
+# ---------- HMAC + HTTP helpers ----------
 
-def _post_json(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    raw = json.dumps(body, separators=(",", ":"), sort_keys=True)
-    sig = _hmac_sha256(EDGE_SECRET, raw)
-    r = requests.post(
-        f"{BASE_URL}{path}",
-        data=raw,
-        headers={
-            "Content-Type": "application/json",
-            "X-Nova-Signature": sig,
-        },
-        timeout=TIMEOUT,
-    )
+def _hmac_sha256_hex(key: str, raw: bytes) -> str:
+    if not key:
+        return ""
+    return hmac.new(key.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+
+
+def _post_json(path: str, body: Dict[str, Any]) -> Any:
+    """
+    POST signed JSON to the bus.
+
+    Bus /api/commands/* endpoints expect header:
+        X-OUTBOX-SIGN = HMAC_SHA256(OUTBOX_SECRET, raw_body_bytes)
+
+    We reuse EDGE_SECRET for this; in the Bus env, OUTBOX_SECRET should match.
+    """
+    raw = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    sig = _hmac_sha256_hex(EDGE_SECRET, raw)
+
+    url = f"{BASE_URL}{path}"
+    headers: Dict[str, str] = {
+        "Content-Type": "application/json",
+    }
+    if sig:
+        headers["X-OUTBOX-SIGN"] = sig
+
+    r = requests.post(url, data=raw, headers=headers, timeout=TIMEOUT)
     if r.status_code >= 400:
         raise requests.HTTPError(f"{r.status_code} {r.text}")
-    return r.json()
+    # Some endpoints return plain values, so guard json()
+    try:
+        return r.json()
+    except Exception:
+        return None
 
-def bus_pull(lease_limit: int = 1) -> Dict[str, Any]:
-    body = {"agent_id": AGENT_ID, "limit": int(lease_limit), "ts": int(time.time())}
+
+def bus_pull(lease_limit: int = 1) -> Any:
+    """
+    Pull NEW commands from /api/commands/pull.
+
+    Body is currently {"limit": N}. agent_id is ignored by the Bus but
+    included for future compatibility.
+    """
+    body = {
+        "agent_id": AGENT_ID,
+        "limit": int(lease_limit),
+    }
     return _post_json("/api/commands/pull", body)
 
-def bus_ack(cmd_id: int, ok: bool, receipt: Dict[str, Any]) -> Dict[str, Any]:
-    body = {"agent_id": AGENT_ID, "cmd_id": int(cmd_id), "ok": bool(ok), "receipt": receipt}
+
+def bus_ack(cmd_id: int, ok: bool, receipt: Dict[str, Any], *, status: Optional[str] = None) -> Any:
+    """
+    Send execution result back to the bus.
+
+    /api/commands/ack accepts:
+      {
+        "id": <cmd_id>,
+        "agent_id": "...",
+        "status": "done" | "error" | "held",
+        "receipt": {...}
+      }
+    """
+    state = status or ("done" if ok else "error")
+    body: Dict[str, Any] = {
+        "id": int(cmd_id),
+        "agent_id": AGENT_ID,
+        "status": state,
+        "receipt": receipt,
+    }
     return _post_json("/api/commands/ack", body)
 
+
 # ---------- Venue resolver ----------
+
 def import_exec_for_venue(venue: str):
     """
-    Import the right executor module for a venue and return its execute_market_order function.
-    Coinbase uses the advanced executor.
+    Return the venue-specific executor callable.
+
+    Each executor module must expose:
+
+        def execute_market_order(intent: Dict[str, Any]) -> Dict[str, Any]:
+            ...
+
+    We keep a thin mapping from venue name → module path.
     """
     module_map = {
         "KRAKEN":    "executors.kraken_executor",
         "BINANCEUS": "executors.binance_us_executor",
-        "COINBASE":  "executors.coinbase_advanced_executor",  # important!
+        # Coinbase uses the advanced executor variant
+        "COINBASE":  "executors.coinbase_advanced_executor",
     }
-    mod_name = module_map.get(venue.upper())
+    mod_name = module_map.get((venue or "").upper())
     if not mod_name:
-        raise ImportError(f"Unsupported venue: {venue}")
+        raise ImportError(f"Unsupported venue: {venue!r}")
 
     mod = importlib.import_module(mod_name)
-    fn  = getattr(mod, "execute_market_order", None)
+    fn = getattr(mod, "execute_market_order", None)
     if not callable(fn):
-        raise AttributeError(f"{mod_name}.execute_market_order missing or not callable")
+        raise ImportError(f"{mod_name} missing execute_market_order()")
     return fn
 
-# ---------- Signature-aware executor adapter ----------
-def _call_exec(exec_fn, intent: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Call executor regardless of its signature:
-      - ()                       -> call without args
-      - (intent)                 -> pass the whole intent
-      - (**kwargs)               -> map common fields and pass kwargs
-    """
-    try:
-        sig = inspect.signature(exec_fn)
-    except Exception:
-        # can’t inspect: best bet is the historical one-arg pattern
-        return exec_fn(intent)
 
-    params = list(sig.parameters.values())
-    required = [
-        p for p in params
-        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-        and p.default is inspect._empty
-    ]
+# ---------- Intent / receipt helpers ----------
 
-    # Case 1: no required args -> call with no arguments
-    if len(required) == 0:
-        return exec_fn()
+def _simulate_receipt(intent: Dict[str, Any], *, reason: str = "simulated") -> Dict[str, Any]:
+    venue  = (intent.get("venue") or "").upper()
+    symbol = intent.get("symbol") or intent.get("pair") or ""
+    side   = (intent.get("side") or "BUY").upper()
+    amt    = float(intent.get("amount_usd") or intent.get("amount") or 0)
 
-    # Case 2: one required arg -> treat it as (intent)
-    if len(required) == 1 and required[0].kind in (
-        inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD
-    ):
-        return exec_fn(intent)
+    return {
+        "normalized": True,
+        "ok": True,
+        "status": "simulated",
+        "venue": venue,
+        "symbol": symbol,
+        "side": side,
+        "amount_usd": amt,
+        "reason": reason,
+        "raw_intent": intent,
+    }
 
-    # Case 3: kwargs mapping
-    names = set(sig.parameters.keys())
-    kw: Dict[str, Any] = {}
 
-    # Common fields executors might want
-    for key in ("symbol", "side", "venue", "amount", "quote_amount", "quote_amount_usd"):
-        if key in names and key in intent:
-            kw[key] = intent[key]
-
-    # Some executors prefer 'pair' instead of 'symbol'
-    if "pair" in names:
-        if "pair" in intent:
-            kw["pair"] = intent["pair"]
-        elif "symbol" in intent:
-            kw["pair"] = intent["symbol"]  # let executor normalize internally
-
-    if kw:
-        return exec_fn(**kw)
-
-    # Last resort
-    return exec_fn(intent)
-
-# ---------- Normalization helpers ----------
 def _normalize_receipt(ok: bool, venue: str, symbol: str, raw: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Standardize what we ACK back to the Bus.
-    Executors may already return in this shape; if so, we pass-through.
+    Wrap executor-specific receipts into a common shape.
     """
-    if raw and "normalized" in raw:  # executor already shaped it
-        return raw
-
-    rid = raw.get("receipt_id") or raw.get("id") or f"edge-{int(time.time())}"
-    status = raw.get("status", "ok" if ok else "error")
-    return {
-        "normalized": {
-            "receipt_id": str(rid),
-            "venue": venue,
-            "symbol": symbol,
-            "status": status,
-            # optional pass-throughs if present
-            **({k: raw[k] for k in ("executed_qty", "avg_price", "fee", "fee_asset") if k in raw}),
-        }
+    base = {
+        "normalized": True,
+        "ok": bool(ok),
+        "venue": venue,
+        "symbol": symbol,
     }
+    if not isinstance(raw, dict):
+        raw = {"raw": raw}
+    return {**base, **raw}
 
-def _simulate_receipt(intent: Dict[str, Any]) -> Dict[str, Any]:
-    """Used when EDGE_MODE=dry or EDGE_HOLD=true."""
-    rid = f"sim-{int(time.time())}"
-    return {
-        "normalized": {
-            "receipt_id": rid,
-            "venue": intent.get("venue", ""),
-            "symbol": intent.get("symbol", ""),
-            "status": "simulated",
-        }
+
+# ---------- Command pull/shape ----------
+
+def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Translate a /api/commands/pull row into a normalized intent dict.
+
+    The Bus returns rows shaped like:
+        {"id","venue","symbol","side","amount_usd","amount_base","note","mode","agent_id","cmd_id"}
+
+    For backward compatibility we also accept a "payload" sub-dict.
+    """
+    if not isinstance(row, dict):
+        return None
+
+    cid = row.get("id") or row.get("cmd_id")
+    if not cid:
+        return None
+
+    payload = row.get("payload") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    def pick(key: str, default: Any = None) -> Any:
+        # Prefer flattened row, fall back to nested payload if present.
+        return row.get(key, payload.get(key, default))
+
+    venue  = (pick("venue") or "").upper()
+    symbol = pick("symbol") or pick("pair") or ""
+    side   = (pick("side") or "BUY").upper()
+
+    amount_usd = pick("amount_usd")
+    if amount_usd is None:
+        amount_usd = pick("amount") or pick("amount_base")
+    try:
+        amount_usd_f = float(amount_usd) if amount_usd is not None else 0.0
+    except Exception:
+        amount_usd_f = 0.0
+
+    mode = (pick("mode") or EDGE_MODE).lower()
+    note = pick("note") or ""
+
+    intent: Dict[str, Any] = {
+        "id": int(cid),
+        "cmd_id": int(cid),
+        "venue": venue,
+        "symbol": symbol,
+        "side": side,
+        "amount_usd": amount_usd_f,
+        "mode": mode,
+        "note": note,
+        "raw": row,
     }
+    # mirror agent_id if present
+    agent_id = pick("agent_id")
+    if agent_id:
+        intent["agent_id"] = agent_id
+    return intent
+
+
+def _poll_commands() -> List[Dict[str, Any]]:
+    """
+    Pull one or more commands from the bus and normalize them.
+
+    Returns a list of intent dicts. Any malformed commands are ACKed
+    as 'held' with an error reason so they don't poison the queue.
+    """
+    try:
+        raw = bus_pull(lease_limit=1)
+    except Exception as e:
+        log.error("pull error: %s", e)
+        return []
+
+    if raw is None:
+        return []
+
+    # /api/commands/pull returns a bare list; tolerate wrapper dicts too.
+    if isinstance(raw, dict):
+        cmds = raw.get("commands") or raw.get("rows") or raw.get("data") or []
+    else:
+        cmds = raw
+
+    if not isinstance(cmds, list):
+        log.warning("unexpected pull payload: %r", raw)
+        return []
+
+    intents: List[Dict[str, Any]] = []
+
+    for row in cmds:
+        intent = _shape_intent_from_row(row)
+        if not intent:
+            # Row without ID; nothing we can do.
+            continue
+
+        cid    = intent["id"]
+        venue  = intent.get("venue") or ""
+        symbol = intent.get("symbol") or ""
+
+        if not venue or not symbol:
+            # Legacy / malformed rows (e.g. from early experiments).
+            msg = f"malformed command id={cid} venue={venue!r} symbol={symbol!r}"
+            log.error(msg)
+            try:
+                bus_ack(
+                    cid,
+                    ok=False,
+                    receipt={
+                        "normalized": True,
+                        "ok": False,
+                        "status": "held",
+                        "error": "missing venue/symbol",
+                        "detail": msg,
+                        "raw_command": row,
+                    },
+                    status="held",
+                )
+            except Exception as e:
+                log.error("failed to ack malformed command %s: %s", cid, e)
+            continue
+
+        intents.append(intent)
+
+    return intents
+
 
 # ---------- Core execution ----------
+
 def execute_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
-    venue  = intent.get("venue", "").upper()
-    symbol = intent.get("symbol", "")
+    venue  = (intent.get("venue") or "").upper()
+    symbol = intent.get("symbol") or intent.get("pair") or ""
+    mode   = (intent.get("mode") or EDGE_MODE).lower()
 
+    # Global holds / dry-run routing.
     if EDGE_HOLD:
-        return _simulate_receipt(intent)
-    if EDGE_MODE != "live":
-        return _simulate_receipt(intent)
+        return _simulate_receipt(intent, reason="EDGE_HOLD")
+    if EDGE_MODE != "live" or mode != "live":
+        return _simulate_receipt(intent, reason=f"mode={EDGE_MODE}, intent_mode={mode}")
 
+    exec_fn = import_exec_for_venue(venue)
+    raw_res = exec_fn(intent)
+
+    if isinstance(raw_res, dict) and raw_res.get("normalized"):
+        return raw_res
+    return _normalize_receipt(True, venue, symbol, raw_res)
+
+
+def main() -> None:
+    log.info("online — mode=%s hold=%s base=%s agent=%s", EDGE_MODE, EDGE_HOLD, BASE_URL, AGENT_ID)
+
+    # Start telemetry pusher thread (non-fatal if it fails)
     try:
-        exec_fn = import_exec_for_venue(venue)
+        start_balance_pusher()
     except Exception as e:
-        raise RuntimeError(f"EXECUTOR_MISSING: {e}")
+            log.error("failed to start balance pusher: %s", e)
 
-    # Run the executor with signature tolerance
-    res = _call_exec(exec_fn, intent)
-
-    # If executor already returns normalized, pass-through; else wrap
-    if isinstance(res, dict) and "normalized" in res:
-        return res
-    return _normalize_receipt(True, venue, symbol, res if isinstance(res, dict) else {})
-
-# ---------- Main poll loop ----------
-def main():
-    log.info(f"online — mode={EDGE_MODE} hold={EDGE_HOLD} base={BASE_URL} agent={AGENT_ID}")
     while True:
-        try:
-            lease = bus_pull(1)
-        except Exception as e:
-            log.error(f"pull error: {e}")
+        intents = _poll_commands()
+        if not intents:
             time.sleep(POLL_SECS)
             continue
 
-        cmds = lease.get("commands") or []
-        if not cmds:
-            time.sleep(POLL_SECS)
-            continue
-
-        for cmd in cmds:
-            cid = cmd.get("id")
-
-            # The Bus returns rows like:
-            # { "id": 14, "ts": ..., "payload": { "agent_id": ..., "type": ..., "payload": { ...intent... } } }
-            envelope = cmd.get("payload") or {}
-            if not isinstance(envelope, dict):
-                envelope = {}
-
-            # Intent is inside envelope["payload"] (or "intent" for future variants)
-            intent = envelope.get("payload") or envelope.get("intent") or {}
-            if not isinstance(intent, dict):
-                intent = {}
-
-            # For debugging: what does the Edge think it is executing?
-            env_agent = envelope.get("agent_id", "")
-            env_type  = envelope.get("type", "")
-            venue     = intent.get("venue", "")
-            symbol    = intent.get("symbol", "")
-
-            log.info(
-                f"exec cmd={cid} agent={env_agent} type={env_type} venue={venue} symbol={symbol}"
-            )
+        for intent in intents:
+            cid    = intent["id"]
+            venue  = intent.get("venue") or ""
+            symbol = intent.get("symbol") or ""
+            log.info("exec cmd=%s agent=%s venue=%s symbol=%s", cid, AGENT_ID, venue, symbol)
 
             try:
                 res = execute_intent(intent)
-                log.info(f"ack cmd={cid} ok=True")
-                bus_ack(cid, True, res)
+                ok = True
             except Exception as e:
-                # best-effort failure receipt
-                venue  = intent.get("venue", "") or venue
-                symbol = intent.get("symbol", "") or symbol
-                log.error(f"executor error {venue}: {e}", exc_info=True)
-                fail = {
-                    "normalized": {
-                        "receipt_id": f"err-{int(time.time())}",
-                        "venue": venue,
-                        "symbol": symbol,
-                        "status": "error",
-                        "error": str(e),
-                    }
+                log.exception("executor error : %s", e)
+                ok = False
+                res = {
+                    "normalized": True,
+                    "ok": False,
+                    "status": "error",
+                    "error": str(e),
+                    "raw_intent": intent,
                 }
-                bus_ack(cid, False, fail)
 
-        # Immediately loop; the Bus controls lease cadence
+            try:
+                bus_ack(
+                    cid,
+                    ok=ok,
+                    receipt=res if isinstance(res, dict) else {
+                        "normalized": True,
+                        "ok": False,
+                        "status": "error",
+                        "error": "non_dict_receipt",
+                    },
+                    status=None if ok else "error",
+                )
+            except Exception as e:
+                log.exception("ack failed for cmd=%s : %s", cid, e)
 
-from telemetry_sender import start_balance_pusher
-start_balance_pusher()
+        # Slight delay between batches
+        time.sleep(POLL_SECS)
+
 
 if __name__ == "__main__":
     main()
