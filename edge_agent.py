@@ -54,28 +54,40 @@ def _hmac_sha256_hex(key: str, raw: bytes) -> str:
         return ""
     return hmac.new(key.encode("utf-8"), raw, hashlib.sha256).hexdigest()
 
-
 def _post_json(path: str, body: Dict[str, Any]) -> Any:
     """
     POST signed JSON to the bus.
 
-    We compute one HMAC and send it under all expected headers so any of the
-    Bus verifiers (edge / outbox / telemetry) will accept it.
+    We always:
+      - JSON-serialize with sort_keys=True and compact separators
+      - HMAC that canonical JSON with EDGE_SECRET
+      - Send it as the request body with header X-OUTBOX-SIGN
     """
-    raw = json.dumps(body).encode("utf-8")
-    sig = _hmac_sha256_hex(EDGE_SECRET, raw)
+    # Canonical JSON (MUST match Bus)
+    raw_sorted = json.dumps(
+        body,
+        separators=(",", ":"),   # no spaces
+        sort_keys=True           # stable field order
+    ).encode("utf-8")
+
+    sig = _hmac_sha256_hex(EDGE_SECRET, raw_sorted)
+
+    # Debug line so we can see exactly what the Edge is sending
+    log.info(
+        "hmac_debug path=%s body=%s sig=%s",
+        path,
+        raw_sorted.decode("utf-8"),
+        sig or "<empty>",
+    )
 
     url = f"{BASE_URL}{path}"
     headers = {
         "Content-Type": "application/json",
     }
     if sig:
-        # Belt-and-suspenders: support all existing verifiers on the Bus
-        headers["X-OUTBOX-SIGN"]    = sig
-        headers["X-EDGE-SIGN"]      = sig
-        headers["X-TELEMETRY-SIGN"] = sig
+        headers["X-OUTBOX-SIGN"] = sig
 
-    r = requests.post(url, data=raw, headers=headers, timeout=TIMEOUT)
+    r = requests.post(url, data=raw_sorted, headers=headers, timeout=TIMEOUT)
     if r.status_code >= 400:
         raise requests.HTTPError(f"{r.status_code} {r.text}")
     try:
