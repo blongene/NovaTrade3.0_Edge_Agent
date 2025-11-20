@@ -62,7 +62,7 @@ def _post_json(path: str, body: Dict[str, Any]) -> Any:
     We compute one HMAC and send it under all expected headers so any of the
     Bus verifiers (edge / outbox / telemetry) will accept it.
     """
-    raw = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    raw = json.dumps(body).encode("utf-8")
     sig = _hmac_sha256_hex(EDGE_SECRET, raw)
 
     url = f"{BASE_URL}{path}"
