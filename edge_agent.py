@@ -403,10 +403,19 @@ def execute_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
     exec_fn = import_exec_for_venue(venue)
     raw_res = exec_fn(intent)
 
+    # If executor already returned a normalized receipt, trust it.
     if isinstance(raw_res, dict) and raw_res.get("normalized"):
         return raw_res
-    return _normalize_receipt(True, venue, symbol, raw_res)
 
+    # Otherwise, infer ok flag from executor payload (status / ok fields).
+    ok_flag = True
+    if isinstance(raw_res, dict):
+        if "ok" in raw_res:
+            ok_flag = bool(raw_res.get("ok"))
+        else:
+            status = str(raw_res.get("status", "")).lower()
+            ok_flag = not status or status == "ok"
+    return _normalize_receipt(ok_flag, venue, symbol, raw_res)
 
 def main() -> None:
     log.info("online — mode=%s hold=%s base=%s agent=%s", EDGE_MODE, EDGE_HOLD, BASE_URL, AGENT_ID)
@@ -431,7 +440,8 @@ def main() -> None:
 
             try:
                 res = execute_intent(intent)
-                ok = True
+                # Use executor-provided ok flag when available.
+                ok = bool(isinstance(res, dict) and res.get("ok", True))
             except Exception as e:
                 log.exception("executor error : %s", e)
                 ok = False
@@ -457,6 +467,7 @@ def main() -> None:
                 )
             except Exception as e:
                 log.exception("ack failed for cmd=%s : %s", cid, e)
+
 
         # Slight delay between batches
         time.sleep(POLL_SECS)
