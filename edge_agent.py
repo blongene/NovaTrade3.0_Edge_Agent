@@ -203,33 +203,89 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Translate a /api/commands/pull row into a normalized intent dict.
 
-    The Bus returns rows shaped like:
-        {"id","venue","symbol","side","amount_usd","amount_base","note","mode","agent_id","cmd_id"}
+    Supported shapes:
 
-    For backward compatibility we also accept a "payload" sub-dict.
+    1) Flat (legacy):
+        {
+          "id": 123,
+          "venue": "BINANCEUS",
+          "symbol": "OCEANUSDT",
+          "side": "BUY",
+          "amount_usd": 50,
+          "mode": "live",
+          "note": "...",
+          "agent_id": "edge-primary",
+        }
+
+    2) Nested (current Bus outbox):
+        {
+          "id": 18,
+          "intent": {
+            "agent_id": "edge-primary",
+            "venue": "KRAKEN",
+            "payload": {
+              "token": "OCEAN",
+              "quote": "USDT",
+              "amount_usd": 4.52,
+              "type": "manual_rebuy",
+              "intent_id": "manual_rebuy:OCEAN:1763694168"
+            }
+          },
+          "status": "held"
+        }
+
+    We support both by:
+      - Looking at row, then intent, then payload
+      - Deriving symbol from token+quote if needed
     """
     if not isinstance(row, dict):
         return None
 
-    cid = row.get("id") or row.get("cmd_id")
+    # v2 commands: nested "intent" object plus "payload"
+    intent_meta = row.get("intent")
+    if not isinstance(intent_meta, dict):
+        intent_meta = {}
+
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        inner = intent_meta.get("payload")
+        payload = inner if isinstance(inner, dict) else {}
+
+    def pick(key: str, default: Any = None) -> Any:
+        """
+        Look for a key across row → intent_meta → payload.
+        First non-empty (not None / "") wins.
+        """
+        for src in (row, intent_meta, payload):
+            if isinstance(src, dict) and key in src:
+                val = src.get(key)
+                if val not in (None, ""):
+                    return val
+        return default
+
+    # Command ID (lives on the row; tolerate legacy cmd_id too)
+    cid = pick("id") or pick("cmd_id")
     if not cid:
         return None
 
-    payload = row.get("payload") or {}
-    if not isinstance(payload, dict):
-        payload = {}
+    # Venue and symbol
+    venue = (pick("venue") or "").upper()
 
-    def pick(key: str, default: Any = None) -> Any:
-        # Prefer flattened row, fall back to nested payload if present.
-        return row.get(key, payload.get(key, default))
-
-    venue  = (pick("venue") or "").upper()
     symbol = pick("symbol") or pick("pair") or ""
-    side   = (pick("side") or "BUY").upper()
+    base   = pick("token") or pick("base")
+    quote  = pick("quote") or pick("quote_asset")
 
+    # Derive symbol if not explicitly present
+    if not symbol and base and quote:
+        symbol = f"{str(base).upper()}/{str(quote).upper()}"
+
+    side = (pick("side") or "BUY").upper()
+
+    # Amount – treat amount_usd as primary, fall back to generic fields.
     amount_usd = pick("amount_usd")
     if amount_usd is None:
-        amount_usd = pick("amount") or pick("amount_base")
+        amount_usd = pick("amount") or pick("amount_base") or pick("amount_quote")
+
     try:
         amount_usd_f = float(amount_usd) if amount_usd is not None else 0.0
     except Exception:
@@ -249,12 +305,22 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "note": note,
         "raw": row,
     }
-    # mirror agent_id if present
+
+    # Base / quote hints for executors
+    if base:
+        base_uc = str(base).upper()
+        intent.setdefault("token", base_uc)
+        intent.setdefault("base", base_uc)
+    if quote:
+        quote_uc = str(quote).upper()
+        intent.setdefault("quote", quote_uc)
+
+    # Mirror agent_id if present anywhere
     agent_id = pick("agent_id")
     if agent_id:
         intent["agent_id"] = agent_id
-    return intent
 
+    return intent
 
 def _poll_commands() -> List[Dict[str, Any]]:
     """
