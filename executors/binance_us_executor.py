@@ -458,10 +458,37 @@ def main():
 if __name__ == "__main__":
     main()
 
-# --- universal drop-in for EdgeAgent ---
+# --- EdgeAgent entrypoint (dict intent) --------------------------------------
 def execute_market_order(intent: dict = None):
-    """EdgeAgent entrypoint shim."""
-    from typing import Dict
-    if intent is None:
+    """Bridge dict-shaped intents from EdgeAgent into the BinanceUS executor."""
+    if not intent:
         return {"status": "noop", "message": "no intent provided"}
-    return execute(intent) if "execute" in globals() else {"status": "ok", "message": "simulated exec"}
+
+    venue  = (intent.get("venue") or "BINANCEUS").upper()
+    symbol = intent.get("symbol") or intent.get("pair") or "BTCUSDT"
+    side   = (intent.get("side") or "BUY").upper()
+
+    # Interpret amount_usd / amount as quote currency to spend.
+    amt = (
+        intent.get("amount_quote")
+        or intent.get("amount_usd")
+        or intent.get("amount")
+        or 0.0
+    )
+    try:
+        amount_quote = float(amt)
+    except Exception:
+        amount_quote = 0.0
+
+    payload = {
+        "venue":  venue,
+        "symbol": symbol,
+        "side":   side,
+        "amount": amount_quote,
+        "flags":  ["quote"],  # treat amount as quote currency
+    }
+    cmd = {
+        "id":     intent.get("id"),
+        "intent": payload,
+    }
+    return exec_command(cmd)
