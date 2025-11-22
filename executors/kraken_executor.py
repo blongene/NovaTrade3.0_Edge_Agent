@@ -124,3 +124,207 @@ def _execute_market_order_core(
         "venue": "KRAKEN",
         "symbol": pair,
         "requested_symbol": requested,
+        "resolved_symbol": pair,
+        "side": side_uc,
+        "client_id": client_id,
+    }
+
+    if edge_hold:
+        out = {
+            **base_payload,
+            "ok": False,
+            "status": "held",
+            "message": "EDGE_HOLD enabled",
+            "fills": [],
+        }
+        return out
+
+    # DRYRUN
+    if edge_mode != "live":
+        px = 60000.0
+        qty = round(
+            (float(amount_quote or 0) / px) if side_uc == "BUY" else float(amount_base or 0),
+            8,
+        )
+        return {
+            **base_payload,
+            "ok": True,
+            "status": "ok",
+            "txid": f"SIM-KR-{int(time.time() * 1000)}",
+            "fills": [{"qty": qty, "price": px}],
+            "executed_qty": qty,
+            "avg_price": px,
+            "message": "kraken dryrun simulated fill",
+        }
+
+    if not (KEY and SEC):
+        return {
+            **base_payload,
+            "ok": False,
+            "status": "error",
+            "message": "Missing KRAKEN_KEY/KRAKEN_SECRET",
+            "fills": [],
+        }
+
+    info = _pair_info(pair)
+    default_min = 0.00005 if pair.startswith("XBT") else 0.0
+    try:
+        ordermin = float(info.get("ordermin", default_min) or default_min)
+    except Exception:
+        ordermin = default_min
+
+    # BUY — quote balance guard (USDT)
+    if side_uc == "BUY":
+        q_spend = float(amount_quote or 0.0)
+        if q_spend <= 0:
+            return {
+                **base_payload,
+                "ok": False,
+                "status": "error",
+                "message": "BUY requires amount_quote > 0",
+                "fills": [],
+            }
+        try:
+            free_usdt = float(_balance().get("USDT", 0.0))
+        except Exception:
+            free_usdt = 0.0
+        if q_spend > free_usdt:
+            return {
+                **base_payload,
+                "ok": False,
+                "status": "error",
+                "message": f"insufficient USDT: have {free_usdt:.2f}, need {q_spend:.2f}",
+                "fills": [],
+            }
+        px = _ticker_price(pair) or 0.0
+        qty = round((q_spend / (px or 1.0)), 8)
+        if qty < ordermin:
+            return {
+                **base_payload,
+                "ok": False,
+                "status": "error",
+                "message": f"min volume {ordermin:.8f} not met",
+                "fills": [],
+            }
+    else:
+        # SELL — clamp to free XBT and respect ordermin
+        try:
+            free_xbt = float(_balance().get("XBT", 0.0))
+        except Exception:
+            free_xbt = 0.0
+        qty_req = float(amount_base or 0.0)
+        qty = round(min(max(0.0, qty_req), max(0.0, free_xbt - 1e-8)), 8)
+        if qty < ordermin:
+            return {
+                **base_payload,
+                "ok": False,
+                "status": "error",
+                "message": f"qty {qty:.8f} < ordermin {ordermin:.8f}",
+                "fills": [],
+            }
+
+    # LIVE order
+    try:
+        res = _private(
+            "/0/private/AddOrder",
+            {
+                "pair": pair,
+                "type": "buy" if side_uc == "BUY" else "sell",
+                "ordertype": "market",
+                "volume": f"{qty:.8f}",
+                "userref": client_id or None,
+            },
+        )
+    except RuntimeError as e:
+        msg = str(e)
+        if "Unknown asset pair" in msg:
+            # Treat as a soft error without throwing a stacktrace in Edge logs.
+            return {
+                **base_payload,
+                "ok": False,
+                "status": "error",
+                "message": msg,
+                "fills": [],
+            }
+        # Other Kraken errors can still bubble to main() and be logged loudly.
+        raise
+
+    txid = (res.get("txid") or [None])[0]
+
+    # Post-trade snapshot
+    post: Dict[str, Any] = {}
+    try:
+        b = _balance()
+        post = {
+            "USDT": float(b.get("USDT", 0.0)),
+            "XBT": float(b.get("XBT", 0.0)),
+        }
+    except Exception:
+        pass
+
+    return {
+        **base_payload,
+        "ok": True,
+        "status": "ok",
+        "txid": txid or f"KR-NOORD-{int(time.time() * 1000)}",
+        "fills": [],
+        "post_balances": post,
+        "message": "kraken live order accepted" if txid else "kraken response parsed",
+    }
+
+
+# --- EdgeAgent entrypoint (dict intent) --------------------------------------
+def execute_market_order(intent: dict | None = None) -> Dict[str, Any]:
+    """Bridge dict-shaped intents from EdgeAgent into the core Kraken executor.
+
+    Expected intent keys:
+      - symbol / pair: e.g. "OCEAN/USDT"
+      - side: "BUY" or "SELL"
+      - amount_usd or amount_quote or amount: quote amount to spend
+      - mode: "live" or "dryrun"
+    """
+    if not intent:
+        return {
+            "status": "noop",
+            "message": "no intent provided",
+            "normalized": True,
+            "ok": False,
+        }
+
+    venue_symbol = intent.get("symbol") or intent.get("pair") or "BTC/USDT"
+    side = intent.get("side") or "BUY"
+
+    # Prefer explicit quote amount; fall back to generic amount / amount_usd.
+    amt_q = (
+        intent.get("amount_quote")
+        or intent.get("amount")
+        or intent.get("amount_usd")
+        or 0.0
+    )
+    try:
+        amount_quote = float(amt_q)
+    except Exception:
+        amount_quote = 0.0
+
+    edge_mode = str(intent.get("mode") or os.getenv("EDGE_MODE", "dryrun")).lower()
+    edge_hold_flag = bool(
+        str(os.getenv("EDGE_HOLD", "false")).strip().lower() == "true"
+        or intent.get("edge_hold") is True
+    )
+
+    client_id = (
+        intent.get("client_id")
+        or intent.get("intent_id")
+        or intent.get("id")
+        or ""
+    )
+
+    return _execute_market_order_core(
+        venue_symbol=venue_symbol,
+        side=side,
+        amount_quote=amount_quote,
+        amount_base=float(intent.get("amount_base") or 0.0),
+        client_id=str(client_id),
+        edge_mode=edge_mode,
+        edge_hold=edge_hold_flag,
+    )
