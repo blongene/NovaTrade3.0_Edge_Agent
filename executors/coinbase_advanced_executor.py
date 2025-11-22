@@ -105,7 +105,7 @@ def _norm_symbol(venue_symbol: str) -> str:
     # BTC/USDC -> BTC-USDC (Coinbase product_id style)
     return (venue_symbol or "BTC/USDC").upper().replace("/", "-").strip()
 
-def execute_market_order(*, venue_symbol: str, side: str,
+def _execute_market_order_core(*, venue_symbol: str, side: str,
                          amount_quote: float = 0.0, amount_base: float = 0.0,
                          client_id: str = "", edge_mode: str = "dryrun",
                          edge_hold: bool = False, **_):
@@ -189,10 +189,46 @@ def execute_market_order(*, venue_symbol: str, side: str,
         return {"status":"error","message":f"coinbase executor exception: {e}","fills":[],
                 "venue":"COINBASE","symbol":symbol,
                 "requested_symbol":requested,"resolved_symbol":symbol,"side":side_uc}
-# --- universal drop-in for EdgeAgent ---
+
+# --- EdgeAgent entrypoint (dict intent) --------------------------------------
 def execute_market_order(intent: dict = None):
-    """EdgeAgent entrypoint shim."""
-    from typing import Dict
-    if intent is None:
+    """Bridge dict-shaped intents from EdgeAgent into the Coinbase executor."""
+    if not intent:
         return {"status": "noop", "message": "no intent provided"}
-    return execute(intent) if "execute" in globals() else {"status": "ok", "message": "simulated exec"}
+
+    venue_symbol = intent.get("symbol") or intent.get("pair") or "BTC/USDC"
+    side        = intent.get("side") or "BUY"
+
+    amt_q = (
+        intent.get("amount_quote")
+        or intent.get("amount")
+        or intent.get("amount_usd")
+        or 0.0
+    )
+    try:
+        amount_quote = float(amt_q)
+    except Exception:
+        amount_quote = 0.0
+
+    edge_mode = str(intent.get("mode") or os.getenv("EDGE_MODE", "dryrun")).lower()
+    edge_hold_flag = bool(
+        str(os.getenv("EDGE_HOLD", "false")).strip().lower() == "true"
+        or intent.get("edge_hold") is True
+    )
+
+    client_id = (
+        intent.get("client_id")
+        or intent.get("intent_id")
+        or intent.get("id")
+        or ""
+    )
+
+    return _execute_market_order_core(
+        venue_symbol=venue_symbol,
+        side=side,
+        amount_quote=amount_quote,
+        amount_base=float(intent.get("amount_base") or 0.0),
+        client_id=str(client_id),
+        edge_mode=edge_mode,
+        edge_hold=edge_hold_flag,
+    )
