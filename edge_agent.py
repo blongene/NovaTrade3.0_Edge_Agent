@@ -22,6 +22,7 @@ import importlib
 import requests
 
 from telemetry_sender import start_balance_pusher  # existing helper
+from telemetry_sender import start_balance_pusher
 
 # ---------- Config ----------
 
