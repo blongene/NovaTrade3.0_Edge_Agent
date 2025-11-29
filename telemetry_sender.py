@@ -62,27 +62,43 @@ def _save_cache(obj: dict):
 def _collect_balances() -> dict:
     """
     Uses existing Edge executors to collect balances:
-      - executors.coinbase_advanced_executor.CoinbaseCDP().balances()  -> {asset: available}
-      - executors.binance_us_executor.get_balances()                   -> {"COINBASE": {...}, "BINANCEUS": {...}}
+      - executors.binance_us_executor.get_balances()  -> {"COINBASE": {...}, "BINANCEUS": {...}, "KRAKEN": {...}}
+        (which itself uses CoinbaseCDP / BinanceUS / Kraken)
     Returns the Bus-friendly shape:
-      {agent, by_venue: {VENUE:{USD:..,USDC:..,USDT:..}}, flat:{BTC:..,ETH:..,...}, ts}
+      {
+        "agent": str,
+        "by_venue": {VENUE: {"USD":..,"USDC":..,"USDT":..}},
+        "flat":    {ASSET: total_across_venues},
+        "ts":      int,
+      }
     """
     agent = os.getenv("EDGE_AGENT_ID") or os.getenv("AGENT_ID") or "edge"
     ts = int(time.time())
 
     # --- pull the venue->asset balances (dict[str, dict[str,float]])
     by_venue_raw: dict[str, dict] = {}
+
+    # Primary path: shared get_balances helper
     try:
-        # Preferred: module that already gathers both venues
         from executors.binance_us_executor import get_balances as _edge_get_balances  # type: ignore
         by_venue_raw = _edge_get_balances() or {}
-    except Exception:
-        # Fallback: try coinbase directly if available, and leave binance out
+    except Exception as e:
+        print(f"[telemetry] get_balances error: {e}")
+
+    # Fallback: if BINANCEUS missing but keys are present, try direct BinanceUS() account()
+    if "BINANCEUS" not in by_venue_raw:
         try:
-            from executors.coinbase_advanced_executor import CoinbaseCDP  # type: ignore
-            by_venue_raw["COINBASE"] = CoinbaseCDP().balances()
-        except Exception:
-            pass
+            from executors.binance_us_executor import BinanceUS  # type: ignore
+            bu = BinanceUS()
+            acct = bu.account() or {}
+            bals = {
+                (b.get("asset") or "").upper(): float(b.get("free") or 0.0)
+                for b in (acct.get("balances") or [])
+            }
+            if bals:
+                by_venue_raw["BINANCEUS"] = bals
+        except Exception as e:
+            print(f"[telemetry] BINANCEUS fallback balances error: {e}")
 
     # --- normalize into by_venue (only quote assets) and flat (sum of base assets across venues)
     quotes = ("USD", "USDC", "USDT")
@@ -108,7 +124,6 @@ def _collect_balances() -> dict:
             by_venue[vkey] = v_out
 
     return {"agent": agent, "by_venue": by_venue, "flat": flat, "ts": ts}
-
 
 def _summarize_snapshot(payload: dict) -> str:
     """
