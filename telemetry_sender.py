@@ -15,18 +15,22 @@ TELEM_DEBUG_DUMP = (os.getenv("TELEMETRY_DEBUG_DUMP") or "0").lower() in {"1", "
 HEADLINE = ("USDT", "USDC", "USD", "BTC", "ETH")
 
 PUSH_IVL = int(os.getenv("PUSH_BALANCES_INTERVAL_SECS", "120"))
-HEARTBEAT_ON_BOOT = os.getenv("PUSH_BALANCES_ON_BOOT", "1").lower() in {"1", "true", "yes", "on"}
+HEARTBEAT_ON_BOOT = os.getenv("PUSH_BALANCES_ON_BOOT", "1").lower() in {"1","true","yes","on"}
 CACHE_PATH = os.getenv("EDGE_LAST_BALANCES_PATH", os.path.expanduser("~/.nova/last_balances.json"))
 
+
 def _hmac_sig(raw: bytes) -> str:
+    if not TELEM_SECRET:
+        return ""
     return hmac.new(TELEM_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+
 
 def _post_json(url: str, payload: dict) -> tuple[int, str]:
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
-    sig = _hmac_sig(raw) if TELEM_SECRET else ""
+    sig = _hmac_sig(raw)
     headers = {"Content-Type": "application/json"}
     if sig:
-        # send both for compatibility
+        # send both for compatibility with Bus
         headers["X-TELEMETRY-SIGN"] = sig
         headers["X-NT-Sig"] = sig
     r = requests.post(
@@ -37,12 +41,14 @@ def _post_json(url: str, payload: dict) -> tuple[int, str]:
     )
     return r.status_code, r.text
 
+
 def _load_cache():
     try:
         with open(CACHE_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
+
 
 def _save_cache(obj: dict):
     try:
@@ -51,6 +57,7 @@ def _save_cache(obj: dict):
             json.dump(obj, f, separators=(",", ":"))
     except Exception:
         pass
+
 
 def _collect_balances() -> dict:
     """
@@ -69,7 +76,7 @@ def _collect_balances() -> dict:
         # Preferred: module that already gathers both venues
         from executors.binance_us_executor import get_balances as _edge_get_balances  # type: ignore
         by_venue_raw = _edge_get_balances() or {}
-    except Exception as e:
+    except Exception:
         # Fallback: try coinbase directly if available, and leave binance out
         try:
             from executors.coinbase_advanced_executor import CoinbaseCDP  # type: ignore
@@ -102,12 +109,13 @@ def _collect_balances() -> dict:
 
     return {"agent": agent, "by_venue": by_venue, "flat": flat, "ts": ts}
 
+
 def _summarize_snapshot(payload: dict) -> str:
     """
     Build a compact human-readable snapshot for logs.
 
     Example:
-        agent=edge-primary BINANCEUS:USDT=123.45,USDC=0.00 | COINBASE:USD=50.00 || flat:BTC=0.015
+        agent=edge-primary BINANCEUS:USDT=123.45,USD=10.00 | COINBASE:USDC=19.30 || flat:BTC=0.015
     """
     try:
         agent = payload.get("agent") or payload.get("agent_id") or "edge"
@@ -145,6 +153,7 @@ def _summarize_snapshot(payload: dict) -> str:
     except Exception as e:
         return f"(summary-error: {e})"
 
+
 def push_balances_once(use_cache_if_empty=True) -> bool:
     payload = _collect_balances()
     # if empty and we have a cache, send cached so Bus has *something* after deploys
@@ -174,7 +183,7 @@ def push_balances_once(use_cache_if_empty=True) -> bool:
         except Exception as e:
             print(f"[telemetry] snapshot-error: {e}")
 
-    ok = False
+    ok = False    # send to Bus
     for attempt in (1, 2, 3):
         try:
             code, text = _post_json("/api/telemetry/push_balances", payload)
@@ -189,6 +198,7 @@ def push_balances_once(use_cache_if_empty=True) -> bool:
             print(f"[telemetry] error: {e}")
         time.sleep(2 ** attempt)  # 2s, 4s backoff
     return ok
+
 
 def start_balance_pusher():
     def loop():
