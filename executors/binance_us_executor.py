@@ -18,6 +18,8 @@ Env (typical):
   BALANCE_SNAPSHOT_SECS=7200
   PUSH_BALANCES_ENABLED=1
   PUSH_BALANCES_EVERY_S=600
+  BINANCE_API_KEY=...
+  BINANCE_API_SECRET=...
 """
 
 from __future__ import annotations
@@ -92,6 +94,164 @@ def parse_symbol(s: str) -> Tuple[str, str]:
         return m.group(1), m.group(2)
     return s, "USD"
 
+# =============== Local BinanceUS Class ===============
+class BinanceUS:
+    def __init__(self):
+        self.api_key = os.getenv("BINANCE_API_KEY")
+        self.secret_key = os.getenv("BINANCE_SECRET_KEY") or os.getenv("BINANCE_API_SECRET")
+        self.base_url = "https://api.binance.us"
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "NovaTrade-Edge/3.0",
+        })
+
+    def _sign(self, params: dict) -> dict:
+        if not self.api_key or not self.secret_key:
+            return params
+        # Timestamp is mandatory
+        if "timestamp" not in params:
+            params["timestamp"] = int(time.time() * 1000)
+
+        # Query string for signature
+        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+        signature = hmac.new(self.secret_key.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
+        params["signature"] = signature
+        return params
+
+    def _request(self, method: str, path: str, params: dict = None, signed: bool = False):
+        url = f"{self.base_url}{path}"
+        params = params or {}
+        headers = {}
+        if signed:
+            if not self.api_key:
+                raise ValueError("Binance API credentials missing")
+            headers["X-MBX-APIKEY"] = self.api_key
+            params = self._sign(params)
+
+        try:
+            # Binance typically accepts query params for GET and DELETE
+            # For POST/PUT, it often accepts data as urlencoded or JSON.
+            # python-binance uses data=params for signed requests (urlencoded).
+            if method.upper() in ("GET", "DELETE"):
+                resp = self.session.request(method, url, params=params, headers=headers, timeout=10)
+            else:
+                resp = self.session.request(method, url, data=params, headers=headers, timeout=10)
+
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            _log(f"BinanceUS request error: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                # Truncate potentially large html error pages
+                _log(f"Response: {e.response.text[:200]}")
+            raise
+
+    def account(self):
+        return self._request("GET", "/api/v3/account", signed=True)
+
+    def get_order(self, symbol: str, clientOrderId: str = None, origClientOrderId: str = None):
+        params = {"symbol": symbol}
+        if clientOrderId:
+            params["origClientOrderId"] = clientOrderId
+        if origClientOrderId:
+            params["origClientOrderId"] = origClientOrderId
+        return self._request("GET", "/api/v3/order", params=params, signed=True)
+
+    def create_order(self, symbol: str, side: str, type: str, quantity: float = None, quoteOrderQty: float = None, newClientOrderId: str = None):
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": type,
+        }
+        if quantity:
+            params["quantity"] = quantity
+        if quoteOrderQty:
+            params["quoteOrderQty"] = quoteOrderQty
+        if newClientOrderId:
+            params["newClientOrderId"] = newClientOrderId
+
+        return self._request("POST", "/api/v3/order", params=params, signed=True)
+
+def binance_execution_wrapper(venue_symbol: str, side: str, amount_quote: float = 0.0, amount_base: float = 0.0,
+                              client_id: str = "", edge_mode: str = "dry", edge_hold: bool = False):
+    """
+    Executes a trade on BinanceUS.
+    """
+    if str(edge_hold).lower() in ("true", "1", "yes"):
+         return {"status": "held", "message": "EDGE_HOLD is enabled", "fills": []}
+
+    if edge_mode == "dry":
+        return {
+            "status": "closed",
+            "filled": True,
+            "fills": [],
+            "message": "dry_run",
+            "average_price": 0.0,
+            "executed_qty": amount_base if amount_base else 0.0
+        }
+
+    # Live execution
+    try:
+        api = BinanceUS()
+        # Symbol parsing: venue_symbol might be BTC-USDT, Binance needs BTCUSDT
+        symbol = venue_symbol.replace("-", "").replace("_", "")
+
+        kw = {"symbol": symbol, "side": side, "type": "MARKET"}
+        if client_id:
+             kw["newClientOrderId"] = client_id
+
+        # BinanceUS Market Order Logic:
+        # BUY: usually spend quote currency -> quoteOrderQty
+        # SELL: usually sell base currency -> quantity
+        if side.upper() == "BUY":
+             if amount_quote > 0:
+                 kw["quoteOrderQty"] = amount_quote
+             elif amount_base > 0:
+                 kw["quantity"] = amount_base
+             else:
+                 raise ValueError("Buy requires amount_quote or amount_base")
+        else: # SELL
+             if amount_base > 0:
+                 kw["quantity"] = amount_base
+             elif amount_quote > 0:
+                  # If we only have quote amount for sell, we'd need price to convert to base,
+                  # but market order doesn't take quoteOrderQty for SELL usually?
+                  # Binance API docs say quoteOrderQty is MARKET orders only.
+                  # "MARKET orders using quoteOrderQty specifies the amount the user wants to spend (when buying) or receive (when selling) the quote asset"
+                  kw["quoteOrderQty"] = amount_quote
+             else:
+                 raise ValueError("Sell requires amount_base or amount_quote")
+
+        res = api.create_order(**kw)
+
+        # Parse result into standard shape
+        fills = []
+        total_qty = 0.0
+        total_cost = 0.0
+        if "fills" in res:
+            for f in res["fills"]:
+                p = float(f.get("price", 0))
+                q = float(f.get("qty", 0))
+                fills.append({"price": p, "qty": q})
+                total_qty += q
+                total_cost += p * q
+
+        avg_price = (total_cost / total_qty) if total_qty else 0.0
+
+        return {
+            "status": "closed" if res.get("status") == "FILLED" else "open",
+            "filled": res.get("status") == "FILLED",
+            "fills": fills,
+            "executed_qty": float(res.get("executedQty", 0)),
+            "avg_price": avg_price,
+            "raw": res
+        }
+
+    except Exception as e:
+        _log(f"Binance execution failed: {e}")
+        return {"status": "error", "message": str(e), "fills": []}
+
+
 # =============== Venue executors ===============
 # Import your real executors. These should accept the call signature below.
 try:
@@ -99,12 +259,6 @@ try:
 except Exception:
     cb_exec = None
     CoinbaseCDP = None  # type: ignore
-
-try:
-    from executors.binance_us_executor import execute_market_order as bus_exec, BinanceUS
-except Exception:
-    bus_exec = None
-    BinanceUS = None  # type: ignore
 
 try:
     from executors.kraken_executor import execute_market_order as kr_exec, _balance as kraken_balance
@@ -117,8 +271,8 @@ EXECUTORS = {
     "COINBASE":    cb_exec,
     "COINBASEADV": cb_exec,
     "CBADV":       cb_exec,
-    "BINANCEUS":   bus_exec,
-    "BUSA":        bus_exec,
+    "BINANCEUS":   binance_execution_wrapper,
+    "BUSA":        binance_execution_wrapper,
     "KRAKEN":      kr_exec,
 }
 
@@ -150,6 +304,7 @@ def get_balances() -> dict:
     except Exception as e:
         _log(f"balances COINBASE error: {e}")
     try:
+        # Now using local BinanceUS class
         if BinanceUS:
             acct = BinanceUS().account()
             out["BINANCEUS"] = { (b.get("asset") or "").upper(): float(b.get("free") or 0.0)
