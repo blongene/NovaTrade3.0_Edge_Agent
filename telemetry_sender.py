@@ -98,58 +98,52 @@ def _save_cache(obj: dict):
 def _collect_balances() -> dict:
     """
     Uses existing Edge executors to collect balances:
-
-      - executors.binance_us_executor.get_balances()
-            -> {"COINBASE": {...}, "BINANCEUS": {...}, "KRAKEN": {...}}
-
-        (which itself uses CoinbaseCDP / BinanceUS / Kraken)
-
+      - executors.coinbase_advanced_executor.CoinbaseCDP().balances()  -> {asset: available}
+      - executors.binance_us_executor.get_balances()                   -> {"COINBASE": {...}, "BINANCEUS": {...}}
     Returns the Bus-friendly shape:
-
-      {
-        "agent": str,
-        "by_venue": {VENUE: {"USD":..,"USDC":..,"USDT":..}},  # quote-only per venue
-        "flat":    {ASSET: total_across_venues},             # all non-quote assets
-        "ts":      int,
-      }
-
-    NOTE: Even if a venue only holds non-quote assets (alts), it will still
-    appear in by_venue with an *empty* dict so the Bus log line includes
-    that venue in its "venues=[...]" list.
+      {agent, by_venue: {VENUE:{USD:..,USDC:..,USDT:..}}, flat:{BTC:..,ETH:..,...}, ts}
     """
     agent = os.getenv("EDGE_AGENT_ID") or os.getenv("AGENT_ID") or "edge"
     ts = int(time.time())
 
     # --- pull the venue->asset balances (dict[str, dict[str,float]])
     by_venue_raw: dict[str, dict] = {}
-
-    # Primary path: shared get_balances helper (preferred)
     try:
-        from executors.binance_us_executor import (  # type: ignore
-            get_balances as _edge_get_balances,
-        )
-
+        # Preferred: module that already gathers all venues
+        from executors.binance_us_executor import get_balances as _edge_get_balances  # type: ignore
         by_venue_raw = _edge_get_balances() or {}
     except Exception as e:
-        print(f"[telemetry] get_balances error: {e}")
-
-    # Fallback: if BINANCEUS missing but class is available, query it directly
-    if "BINANCEUS" not in by_venue_raw:
+        # Fallback: try coinbase directly if available, and leave binance out
         try:
-            from executors.binance_us_executor import BinanceUS  # type: ignore
+            from executors.coinbase_advanced_executor import CoinbaseCDP  # type: ignore
+            by_venue_raw["COINBASE"] = CoinbaseCDP().balances()
+        except Exception:
+            pass
+        # DEBUG: log why binance path failed
+        print(f"[telemetry] get_balances() error, using fallback COINBASE-only: {e}")
 
-            bu = BinanceUS()
-            acct = bu.account() or {}
-            bals = {
-                (b.get("asset") or "").upper(): float(b.get("free") or 0.0)
-                for b in (acct.get("balances") or [])
-            }
-            if bals:
-                by_venue_raw["BINANCEUS"] = bals
-        except Exception as e:
-            print(f"[telemetry] BINANCEUS fallback balances error: {e}")
+    # --- DEBUG: show what we actually got back per venue (quotes only)
+    try:
+        dbg_bits = []
+        for venue, assets in (by_venue_raw or {}).items():
+            if not isinstance(assets, dict):
+                continue
+            pieces = []
+            for q in ("USD", "USDC", "USDT"):
+                if q in assets:
+                    try:
+                        pieces.append(f"{q}={float(assets[q] or 0):.6f}")
+                    except Exception:
+                        pieces.append(f"{q}=?")
+            dbg_bits.append(f"{venue}:{','.join(pieces) or 'no-quotes'}")
+        if dbg_bits:
+            print(f"[telemetry] raw balances venues={len(by_venue_raw)} " + " | ".join(dbg_bits))
+        else:
+            print("[telemetry] raw balances EMPTY from get_balances()")
+    except Exception as e:
+        print(f"[telemetry] debug summary failed: {e}")
 
-    # --- normalize into by_venue (only quote assets) and flat (sum of base assets)
+    # --- normalize into by_venue (only quote assets) and flat (sum of base assets across venues)
     quotes = ("USD", "USDC", "USDT")
     by_venue: dict[str, dict[str, float]] = {}
     flat: dict[str, float] = {}
@@ -157,42 +151,22 @@ def _collect_balances() -> dict:
     for venue, assets in (by_venue_raw or {}).items():
         if not isinstance(assets, dict):
             continue
-
         vkey = (venue or "").upper()
         v_out: dict[str, float] = {}
-        has_any_asset = False  # track if this venue had *any* balances at all
-
         for asset, amt in assets.items():
             try:
                 a = (asset or "").upper()
                 x = float(amt or 0.0)
             except Exception:
                 continue
-
-            if x != 0.0:
-                has_any_asset = True
-
             if a in quotes:
                 v_out[a] = v_out.get(a, 0.0) + x
             else:
                 flat[a] = flat.get(a, 0.0) + x
-
-        # Keep the venue if it has any balances at all, even if no quote assets.
-        # This ensures BINANCEUS still shows up in the Bus snapshot line when it
-        # only holds alts.
-        if v_out or has_any_asset:
+        if v_out:
             by_venue[vkey] = v_out
 
-    # Optional additional hint if some venues disappeared after quote-only filter
-    missing_venues = set((by_venue_raw or {}).keys()) - set(by_venue.keys())
-    if missing_venues:
-        print(
-            f"[telemetry] venues with only zero balances (skipped in by_venue): "
-            f"{','.join(sorted(missing_venues))}"
-        )
-
     return {"agent": agent, "by_venue": by_venue, "flat": flat, "ts": ts}
-
 
 # --------------------------------------------------------------------------- #
 # Human-readable summary for Edge logs
