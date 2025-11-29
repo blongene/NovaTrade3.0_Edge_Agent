@@ -23,11 +23,16 @@ def _hmac_sig(raw: bytes) -> str:
 
 def _post_json(url: str, payload: dict) -> tuple[int, str]:
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
-    sig = _hmac_sig(raw)
+    sig = _hmac_sig(raw) if TELEM_SECRET else ""
+    headers = {"Content-Type": "application/json"}
+    if sig:
+        # send both for compatibility
+        headers["X-TELEMETRY-SIGN"] = sig
+        headers["X-NT-Sig"] = sig
     r = requests.post(
         f"{BUS_BASE}{url}",
         data=raw,
-        headers={"Content-Type": "application/json", "X-NT-Sig": sig},
+        headers=headers,
         timeout=10,
     )
     return r.status_code, r.text
