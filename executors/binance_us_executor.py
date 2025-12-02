@@ -194,7 +194,7 @@ def binance_execution_wrapper(venue_symbol: str, side: str, amount_quote: float 
     try:
         api = BinanceUS()
         # Symbol parsing: venue_symbol might be BTC-USDT, Binance needs BTCUSDT
-        symbol = venue_symbol.replace("-", "").replace("_", "")
+        symbol = venue_symbol.replace("-", "").replace("_", "").replace("/", "")
 
         kw = {"symbol": symbol, "side": side, "type": "MARKET"}
         if client_id:
