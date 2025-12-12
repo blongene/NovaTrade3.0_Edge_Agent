@@ -611,21 +611,40 @@ def resolve_symbol(venue_key: str, base: str, quote: str) -> str:
 
 
 def normalize_amounts_from_intent(intent: Dict[str, Any], price: float) -> Dict[str, float]:
-    amt = float(intent.get("amount", 0) or 0)
-    flags = {str(x).lower() for x in intent.get("flags", [])}
+    """
+    Robust sizing:
+      - If amount_quote/quote_amount/amount_usd exists -> treat as quote spend
+      - Else if flags contains 'quote' -> treat intent['amount'] as quote spend
+      - Else treat intent['amount'] as base qty
+    """
     out = {"amount_base": 0.0, "amount_quote": 0.0}
 
+    # Explicit quote fields win
+    amt_quote = (
+        intent.get("amount_quote")
+        or intent.get("quote_amount")
+        or intent.get("amount_usd")
+    )
+    if amt_quote is not None:
+        out["amount_quote"] = max(0.0, float(amt_quote or 0.0))
+        if price and price > 0:
+            out["amount_base"] = out["amount_quote"] / float(price)
+        return out
+
+    # Flag-driven quote mode (legacy)
+    amt = float(intent.get("amount", 0) or 0)
+    flags = {str(x).lower() for x in intent.get("flags", [])}
     if "quote" in flags:
         out["amount_quote"] = max(0.0, amt)
         if price and price > 0:
             out["amount_base"] = out["amount_quote"] / float(price)
-    else:
-        out["amount_base"] = max(0.0, amt)
-        if price and price > 0:
-            out["amount_quote"] = out["amount_base"] * float(price)
+        return out
 
+    # Default: amount is base qty
+    out["amount_base"] = max(0.0, amt)
+    if price and price > 0:
+        out["amount_quote"] = out["amount_base"] * float(price)
     return out
-
 
 def execute_market(
     venue_key: str,
