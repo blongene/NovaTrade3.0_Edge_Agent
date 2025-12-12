@@ -199,16 +199,42 @@ def execute_market_order(intent: dict = None):
     venue_symbol = intent.get("symbol") or intent.get("pair") or "BTC/USDC"
     side        = intent.get("side") or "BUY"
 
-    amt_q = (
-        intent.get("amount_quote")
-        or intent.get("amount")
-        or intent.get("amount_usd")
-        or 0.0
-    )
+    # --- Amount normalization -------------------------------------------------
+raw_amount = intent.get("amount")
+
+amt_q = intent.get("amount_quote") or intent.get("amount_usd")
+if amt_q is None:
+    amt_q = 0.0
+
+try:
+    amount_base = float(intent.get("amount_base") or 0.0)
+except Exception:
+    amount_base = 0.0
+
+if (not amount_base) and (raw_amount is not None):
     try:
-        amount_quote = float(amt_q)
+        a = float(raw_amount)
     except Exception:
-        amount_quote = 0.0
+        a = None
+    if a and a > 0:
+        has_quote_context = bool(intent.get("amount_quote") or intent.get("amount_usd") or intent.get("quote"))
+        if a < 1.0 and (has_quote_context or "/" in str(symbol)):
+            amount_base = a
+        else:
+            amt_q = a
+
+try:
+    amount_quote = float(amt_q or 0.0)
+except Exception:
+    amount_quote = 0.0
+
+if (amount_quote == 0.0) and (amount_base > 0.0):
+    try:
+        px = float(intent.get("price_usd") or 0.0)
+        if px > 0:
+            amount_quote = amount_base * px
+    except Exception:
+        pass
 
     edge_mode = str(intent.get("mode") or os.getenv("EDGE_MODE", "dryrun")).lower()
     edge_hold_flag = bool(
@@ -227,7 +253,7 @@ def execute_market_order(intent: dict = None):
         venue_symbol=venue_symbol,
         side=side,
         amount_quote=amount_quote,
-        amount_base=float(intent.get("amount_base") or 0.0),
+        amount_base=amount_base,
         client_id=str(client_id),
         edge_mode=edge_mode,
         edge_hold=edge_hold_flag,
