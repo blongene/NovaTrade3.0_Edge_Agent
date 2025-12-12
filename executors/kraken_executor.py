@@ -296,73 +296,73 @@ def execute_market_order(intent: dict | None = None) -> Dict[str, Any]:
 
     # Prefer explicit quote amount; fall back to generic amount / amount_usd.
     # --- Amount normalization -------------------------------------------------
-# We support multiple intent shapes:
-#   * amount_quote / amount_usd  -> spend in quote terms
-#   * amount_base               -> size in base terms
-#   * amount                    -> may be either (legacy), especially after auto-resize
-raw_amount = intent.get("amount")
-
-# Prefer explicit quote spend fields. Only fall back to `amount` if we are NOT
-# interpreting it as a base quantity.
-amt_q = intent.get("amount_quote") or intent.get("amount_usd")
-if amt_q is None:
-    amt_q = 0.0
-
-# Base quantity
-try:
-    amount_base = float(intent.get("amount_base") or 0.0)
-except Exception:
-    amount_base = 0.0
-
-# If `amount_base` is missing but `amount` looks like a base quantity (tiny)
-# and we also have quote context, treat it as base.
-if (not amount_base) and (raw_amount is not None):
+    # We support multiple intent shapes:
+    #   * amount_quote / amount_usd  -> spend in quote terms
+    #   * amount_base               -> size in base terms
+    #   * amount                    -> may be either (legacy), especially after auto-resize
+    raw_amount = intent.get("amount")
+    
+    # Prefer explicit quote spend fields. Only fall back to `amount` if we are NOT
+    # interpreting it as a base quantity.
+    amt_q = intent.get("amount_quote") or intent.get("amount_usd")
+    if amt_q is None:
+        amt_q = 0.0
+    
+    # Base quantity
     try:
-        a = float(raw_amount)
+        amount_base = float(intent.get("amount_base") or 0.0)
     except Exception:
-        a = None
-    if a and a > 0:
-        has_quote_context = bool(intent.get("amount_quote") or intent.get("amount_usd") or intent.get("quote"))
-        if a < 1.0 and (has_quote_context or "/" in str(venue_symbol)):
-            amount_base = a
-        else:
-            # treat as quote spend (legacy)
-            amt_q = a
-
-# Quote spend
-try:
-    amount_quote = float(amt_q or 0.0)
-except Exception:
-    amount_quote = 0.0
-
-# If we have a base qty but no quote spend, estimate from price_usd when available.
-if (amount_quote == 0.0) and (amount_base > 0.0):
+        amount_base = 0.0
+    
+    # If `amount_base` is missing but `amount` looks like a base quantity (tiny)
+    # and we also have quote context, treat it as base.
+    if (not amount_base) and (raw_amount is not None):
+        try:
+            a = float(raw_amount)
+        except Exception:
+            a = None
+        if a and a > 0:
+            has_quote_context = bool(intent.get("amount_quote") or intent.get("amount_usd") or intent.get("quote"))
+            if a < 1.0 and (has_quote_context or "/" in str(venue_symbol)):
+                amount_base = a
+            else:
+                # treat as quote spend (legacy)
+                amt_q = a
+    
+    # Quote spend
     try:
-        px = float(intent.get("price_usd") or 0.0)
-        if px > 0:
-            amount_quote = amount_base * px
+        amount_quote = float(amt_q or 0.0)
     except Exception:
-        pass
-
-    edge_mode = str(intent.get("mode") or os.getenv("EDGE_MODE", "dryrun")).lower()
-    edge_hold_flag = bool(
-        str(os.getenv("EDGE_HOLD", "false")).strip().lower() == "true"
-        or intent.get("edge_hold") is True
-    )
-
-    client_id = (
-        intent.get("client_id")
-        or intent.get("intent_id")
-        or intent.get("id")
-        or ""
-    )
-
-    return _execute_market_order_core(
-        venue_symbol=venue_symbol,
-        side=side,
-        amount_quote=amount_quote,
-        amount_base=amount_base,
-        client_id=str(client_id),
-        edge_mode=edge_mode,
-        edge_hold=edge_hold_flag,
-    )
+        amount_quote = 0.0
+    
+    # If we have a base qty but no quote spend, estimate from price_usd when available.
+    if (amount_quote == 0.0) and (amount_base > 0.0):
+        try:
+            px = float(intent.get("price_usd") or 0.0)
+            if px > 0:
+                amount_quote = amount_base * px
+        except Exception:
+            pass
+    
+        edge_mode = str(intent.get("mode") or os.getenv("EDGE_MODE", "dryrun")).lower()
+        edge_hold_flag = bool(
+            str(os.getenv("EDGE_HOLD", "false")).strip().lower() == "true"
+            or intent.get("edge_hold") is True
+        )
+    
+        client_id = (
+            intent.get("client_id")
+            or intent.get("intent_id")
+            or intent.get("id")
+            or ""
+        )
+    
+        return _execute_market_order_core(
+            venue_symbol=venue_symbol,
+            side=side,
+            amount_quote=amount_quote,
+            amount_base=amount_base,
+            client_id=str(client_id),
+            edge_mode=edge_mode,
+            edge_hold=edge_hold_flag,
+        )
