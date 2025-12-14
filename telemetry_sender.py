@@ -98,10 +98,15 @@ def _save_cache(obj: dict):
 def _collect_balances() -> dict:
     """
     Uses existing Edge executors to collect balances:
-      - executors.coinbase_advanced_executor.CoinbaseCDP().balances()  -> {asset: available}
-      - executors.binance_us_executor.get_balances()                   -> {"COINBASE": {...}, "BINANCEUS": {...}}
+      - executors.binance_us_executor.get_balances() -> {"COINBASE": {...}, "BINANCEUS": {...}, "KRAKEN": {...}}
     Returns the Bus-friendly shape:
       {agent, by_venue: {VENUE:{USD:..,USDC:..,USDT:..}}, flat:{BTC:..,ETH:..,...}, ts}
+
+    IMPORTANT:
+      Some venues (notably COINBASE) may have *no* quote assets (USD/USDC/USDT) at a given moment.
+      Older versions of this file omitted that venue from `by_venue` entirely, which caused the Bus
+      telemetry mirror to treat the snapshot as incomplete and skip Wallet_Monitor writes.
+      We now ALWAYS include venues from VENUE_ORDER with zero-quote placeholders.
     """
     agent = os.getenv("EDGE_AGENT_ID") or os.getenv("AGENT_ID") or "edge"
     ts = int(time.time())
@@ -163,10 +168,31 @@ def _collect_balances() -> dict:
                 v_out[a] = v_out.get(a, 0.0) + x
             else:
                 flat[a] = flat.get(a, 0.0) + x
+
+        # Keep quote balances if present
         if v_out:
             by_venue[vkey] = v_out
 
+    # --- Ensure required venues are present (zero placeholders are OK / truthful)
+    venue_order = [
+        v.strip().upper()
+        for v in (os.getenv("VENUE_ORDER", "") or "").split(",")
+        if v.strip()
+    ]
+    required = venue_order[:] if venue_order else sorted({(k or "").upper() for k in (by_venue_raw or {}).keys() if k})
+
+    for v in required:
+        if not v:
+            continue
+        if v not in by_venue:
+            by_venue[v] = {q: 0.0 for q in quotes}
+        else:
+            # ensure all quote keys exist (avoid KeyError downstream)
+            for q in quotes:
+                by_venue[v].setdefault(q, 0.0)
+
     return {"agent": agent, "by_venue": by_venue, "flat": flat, "ts": ts}
+
 
 # --------------------------------------------------------------------------- #
 # Human-readable summary for Edge logs
