@@ -6,11 +6,12 @@ import hmac
 import hashlib
 import threading
 from datetime import datetime
+from typing import Dict, Any, Tuple, Optional, List
 
 import requests
 
 # Base URL for the Bus (NovaTrade 3.0 cloud)
-BUS_BASE = os.getenv("CLOUD_BASE_URL") or os.getenv("BUS_BASE_URL", "").rstrip("/")
+BUS_BASE = (os.getenv("CLOUD_BASE_URL") or os.getenv("BUS_BASE_URL", "") or "").rstrip("/")
 
 # HMAC secret shared with the Bus (wsgi.py /api/telemetry/push_balances)
 TELEM_SECRET = os.getenv("TELEMETRY_SECRET", "")
@@ -33,7 +34,7 @@ TELEM_DEBUG_DUMP = (os.getenv("TELEMETRY_DEBUG_DUMP") or "0").lower() in {
 HEADLINE = ("USDT", "USDC", "USD", "BTC", "ETH")
 
 PUSH_IVL = int(os.getenv("PUSH_BALANCES_INTERVAL_SECS", "120"))
-HEARTBEAT_ON_BOOT = os.getenv("PUSH_BALANCES_ON_BOOT", "1").lower() in {
+HEARTBEAT_ON_BOOT = (os.getenv("PUSH_BALANCES_ON_BOOT") or "1").lower() in {
     "1",
     "true",
     "yes",
@@ -42,6 +43,9 @@ HEARTBEAT_ON_BOOT = os.getenv("PUSH_BALANCES_ON_BOOT", "1").lower() in {
 CACHE_PATH = os.getenv(
     "EDGE_LAST_BALANCES_PATH", os.path.expanduser("~/.nova/last_balances.json")
 )
+
+# Quotes we treat as “venue liquidity”
+QUOTES = ("USD", "USDC", "USDT")
 
 
 # --------------------------------------------------------------------------- #
@@ -53,7 +57,7 @@ def _hmac_sig(raw: bytes) -> str:
     return hmac.new(TELEM_SECRET.encode(), raw, hashlib.sha256).hexdigest()
 
 
-def _post_json(path: str, payload: dict) -> tuple[int, str]:
+def _post_json(path: str, payload: dict) -> Tuple[int, str]:
     if not BUS_BASE:
         return 0, "BUS_BASE not configured"
 
@@ -74,7 +78,7 @@ def _post_json(path: str, payload: dict) -> tuple[int, str]:
 # --------------------------------------------------------------------------- #
 # Cache helpers (so Bus always has *something* after deploys)
 # --------------------------------------------------------------------------- #
-def _load_cache():
+def _load_cache() -> Optional[dict]:
     try:
         with open(CACHE_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -82,7 +86,7 @@ def _load_cache():
         return None
 
 
-def _save_cache(obj: dict):
+def _save_cache(obj: dict) -> None:
     try:
         os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
         with open(CACHE_PATH, "w", encoding="utf-8") as f:
@@ -93,37 +97,84 @@ def _save_cache(obj: dict):
 
 
 # --------------------------------------------------------------------------- #
+# Env helpers
+# --------------------------------------------------------------------------- #
+def _env_list(*names: str) -> List[str]:
+    """
+    Return first non-empty comma-separated env list among names.
+    Normalizes to uppercase, strips blanks.
+    """
+    for nm in names:
+        raw = (os.getenv(nm, "") or "").strip()
+        if raw:
+            return [x.strip().upper() for x in raw.split(",") if x.strip()]
+    return []
+
+
+def _required_venues(by_venue_raw: Dict[str, Any]) -> List[str]:
+    """
+    Stable required venues list:
+      1) VENUE_ORDER (Edge explicit)
+      2) TELEMETRY_REQUIRED_VENUES (Bus-style)
+      3) ROUTER_ALLOWED / VENUES_ALLOWED (Edge router style)
+      4) fallback default (keeps Bus happy)
+    """
+    venue_order = _env_list("VENUE_ORDER")
+    if venue_order:
+        return venue_order
+
+    req = _env_list("TELEMETRY_REQUIRED_VENUES")
+    if req:
+        return req
+
+    allowed = _env_list("ROUTER_ALLOWED", "ROUTER_ALLOWED_VENUES", "VENUES_ALLOWED")
+    if allowed:
+        return allowed
+
+    # fallback (NovaTrade core 3)
+    return ["BINANCEUS", "KRAKEN", "COINBASE"]
+
+
+# --------------------------------------------------------------------------- #
 # Balance collection
 # --------------------------------------------------------------------------- #
 def _collect_balances() -> dict:
     """
     Uses existing Edge executors to collect balances:
       - executors.binance_us_executor.get_balances() -> {"COINBASE": {...}, "BINANCEUS": {...}, "KRAKEN": {...}}
-    Returns the Bus-friendly shape:
-      {agent, by_venue: {VENUE:{USD:..,USDC:..,USDT:..}}, flat:{BTC:..,ETH:..,...}, ts}
 
-    IMPORTANT:
-      Some venues (notably COINBASE) may have *no* quote assets (USD/USDC/USDT) at a given moment.
-      Older versions of this file omitted that venue from `by_venue` entirely, which caused the Bus
-      telemetry mirror to treat the snapshot as incomplete and skip Wallet_Monitor writes.
-      We now ALWAYS include venues from VENUE_ORDER with zero-quote placeholders.
+    Returns the Bus-friendly shape:
+      {agent, by_venue: {VENUE:{USD:..,USDC:..,USDT:..}}, flat:{BTC:..,ETH:..,...}, ts, errors?}
+
+    HARDENING (important):
+      - Always includes required venues (VENUE_ORDER/TELEMETRY_REQUIRED_VENUES/ROUTER_ALLOWED)
+      - Missing venues get zero-quote placeholders (truthful + prevents Bus gating)
+      - Emits payload["errors"] with concise root cause keys if collection fails
     """
     agent = os.getenv("EDGE_AGENT_ID") or os.getenv("AGENT_ID") or "edge"
     ts = int(time.time())
 
+    errors: Dict[str, str] = {}
+
     # --- pull the venue->asset balances (dict[str, dict[str,float]])
-    by_venue_raw: dict[str, dict] = {}
+    by_venue_raw: Dict[str, Dict[str, Any]] = {}
+
     try:
         # Preferred: module that already gathers all venues
         from executors.binance_us_executor import get_balances as _edge_get_balances  # type: ignore
+
         by_venue_raw = _edge_get_balances() or {}
     except Exception as e:
-        # Fallback: try coinbase directly if available, and leave binance out
+        errors["BALANCE_COLLECT"] = str(e)[:220]
+
+        # Fallback: try coinbase directly if available, and leave others out
         try:
             from executors.coinbase_advanced_executor import CoinbaseCDP  # type: ignore
+
             by_venue_raw["COINBASE"] = CoinbaseCDP().balances()
-        except Exception:
-            pass
+        except Exception as ee:
+            errors["COINBASE_FALLBACK"] = str(ee)[:220]
+
         # DEBUG: log why binance path failed
         print(f"[telemetry] get_balances() error, using fallback COINBASE-only: {e}")
 
@@ -134,7 +185,7 @@ def _collect_balances() -> dict:
             if not isinstance(assets, dict):
                 continue
             pieces = []
-            for q in ("USD", "USDC", "USDT"):
+            for q in QUOTES:
                 if q in assets:
                     try:
                         pieces.append(f"{q}={float(assets[q] or 0):.6f}")
@@ -146,52 +197,62 @@ def _collect_balances() -> dict:
         else:
             print("[telemetry] raw balances EMPTY from get_balances()")
     except Exception as e:
+        errors["DEBUG_SUMMARY"] = str(e)[:220]
         print(f"[telemetry] debug summary failed: {e}")
 
     # --- normalize into by_venue (only quote assets) and flat (sum of base assets across venues)
-    quotes = ("USD", "USDC", "USDT")
-    by_venue: dict[str, dict[str, float]] = {}
-    flat: dict[str, float] = {}
+    by_venue: Dict[str, Dict[str, float]] = {}
+    flat: Dict[str, float] = {}
 
     for venue, assets in (by_venue_raw or {}).items():
         if not isinstance(assets, dict):
             continue
-        vkey = (venue or "").upper()
-        v_out: dict[str, float] = {}
+
+        vkey = (venue or "").upper().strip()
+        if not vkey:
+            continue
+
+        v_out: Dict[str, float] = {}
+
         for asset, amt in assets.items():
             try:
-                a = (asset or "").upper()
+                a = (asset or "").upper().strip()
                 x = float(amt or 0.0)
             except Exception:
                 continue
-            if a in quotes:
+
+            if not a:
+                continue
+
+            if a in QUOTES:
                 v_out[a] = v_out.get(a, 0.0) + x
             else:
                 flat[a] = flat.get(a, 0.0) + x
 
-        # Keep quote balances if present
+        # Keep quote balances if present (otherwise we may still add placeholders below)
         if v_out:
             by_venue[vkey] = v_out
 
     # --- Ensure required venues are present (zero placeholders are OK / truthful)
-    venue_order = [
-        v.strip().upper()
-        for v in (os.getenv("VENUE_ORDER", "") or "").split(",")
-        if v.strip()
-    ]
-    required = venue_order[:] if venue_order else sorted({(k or "").upper() for k in (by_venue_raw or {}).keys() if k})
+    required = _required_venues(by_venue_raw)
 
     for v in required:
+        v = (v or "").upper().strip()
         if not v:
             continue
+
         if v not in by_venue:
-            by_venue[v] = {q: 0.0 for q in quotes}
+            # Missing or no quote assets: keep venue present with 0 placeholders
+            by_venue[v] = {q: 0.0 for q in QUOTES}
         else:
             # ensure all quote keys exist (avoid KeyError downstream)
-            for q in quotes:
+            for q in QUOTES:
                 by_venue[v].setdefault(q, 0.0)
 
-    return {"agent": agent, "by_venue": by_venue, "flat": flat, "ts": ts}
+    payload = {"agent": agent, "by_venue": by_venue, "flat": flat, "ts": ts}
+    if errors:
+        payload["errors"] = errors
+    return payload
 
 
 # --------------------------------------------------------------------------- #
@@ -202,12 +263,13 @@ def _summarize_snapshot(payload: dict) -> str:
     Build a compact human-readable snapshot for logs.
 
     Example:
-        agent=edge-primary BINANCEUS:USDT=123.45,USD=10.00 | COINBASE:USDC=19.30 || flat:BTC=0.015
+        agent=edge-primary BINANCEUS:USDT=123.45,USD=10.00 | COINBASE:USDC=19.30 errors=COINBASE_FALLBACK || flat:BTC=0.015
     """
     try:
         agent = payload.get("agent") or payload.get("agent_id") or "edge"
         by_venue = payload.get("by_venue") or {}
         flat = payload.get("flat") or {}
+        errs = payload.get("errors") or {}
 
         parts = []
         for venue, amap in sorted(by_venue.items()):
@@ -220,7 +282,7 @@ def _summarize_snapshot(payload: dict) -> str:
                         bits.append(f"{asset}={float(amap[asset]):.2f}")
                     except Exception:
                         pass
-            # Show venue name even if no headline quote assets (alts-only venue)
+            # Show venue name even if no headline quote assets (alts-only venue / or placeholder-only)
             label = venue
             if bits:
                 parts.append(f"{label}:" + ",".join(bits))
@@ -239,8 +301,15 @@ def _summarize_snapshot(payload: dict) -> str:
         if flat_bits:
             tail = " || flat:" + ",".join(flat_bits)
 
+        err_tail = ""
+        if isinstance(errs, dict) and errs:
+            try:
+                err_tail = " errors=" + ",".join(sorted([str(k) for k in errs.keys()]))
+            except Exception:
+                err_tail = " errors=1"
+
         core = " | ".join(parts) if parts else "no venues"
-        return f"agent={agent} {core}{tail}"
+        return f"agent={agent} {core}{err_tail}{tail}"
     except Exception as e:
         return f"(summary-error: {e})"
 
