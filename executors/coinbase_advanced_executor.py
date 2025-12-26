@@ -149,28 +149,50 @@ class CoinbaseCDP:
     def balances(self) -> Dict[str, float]:
         """
         Return {asset_symbol: available_float} using brokerage accounts list.
-        If Coinbase auth fails, we raise with a short message so upstream can log once.
+        Hardened against Coinbase response shape variations.
         """
         r = self._req("GET", ACCTS_PATH, None)
         if not r.ok:
-            # keep this tight: upstream logger will include it.
             raise RuntimeError(f"COINBASE accounts HTTP {r.status_code}: {r.text[:240]}")
-
-        j = {}
+    
         try:
             j = r.json()
         except Exception:
             raise RuntimeError("COINBASE accounts returned non-JSON response")
-
+    
+        accounts = j.get("accounts") or []
         out: Dict[str, float] = {}
-        for a in (j.get("accounts") or []):
-            sym = ((a.get("currency") or {}).get("code") or "").upper().strip()
+    
+        for a in accounts:
+            if not isinstance(a, dict):
+                continue
+    
+            # --- currency code ---
+            cur = a.get("currency")
+            if isinstance(cur, dict):
+                sym = (cur.get("code") or "").upper().strip()
+            elif isinstance(cur, str):
+                sym = cur.upper().strip()
+            else:
+                sym = ""
+    
+            if not sym:
+                continue
+    
+            # --- available balance ---
+            bal = a.get("available_balance")
+            if isinstance(bal, dict):
+                val = bal.get("value", 0)
+            else:
+                val = bal
+    
             try:
-                av = float((a.get("available_balance") or {}).get("value") or 0)
+                amt = float(val)
             except Exception:
-                av = 0.0
-            if sym:
-                out[sym] = av
+                amt = 0.0
+    
+            out[sym] = amt
+    
         return out
 
     def place_market(
