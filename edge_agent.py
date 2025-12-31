@@ -33,8 +33,10 @@ BASE_URL = (
 EDGE_SECRET = os.getenv("EDGE_SECRET", "")
 AGENT_ID    = os.getenv("AGENT_ID", "edge-primary")
 
-EDGE_MODE = os.getenv("EDGE_MODE", "live").lower()   # "live" or "dryrun"
-EDGE_HOLD = os.getenv("EDGE_HOLD", "false").lower() == "true"
+EDGE_MODE = (os.getenv("EDGE_MODE", "live") or "live").strip().lower()   # "live" or "dryrun"
+if EDGE_MODE == "dry":
+    EDGE_MODE = "dryrun"
+EDGE_HOLD = (os.getenv("EDGE_HOLD","false") or "false").strip().lower() in ("1","true","yes","y","on")
 
 POLL_SECS = float(os.getenv("EDGE_POLL_SECS", "5"))
 TIMEOUT   = float(os.getenv("EDGE_HTTP_TIMEOUT", "15"))
