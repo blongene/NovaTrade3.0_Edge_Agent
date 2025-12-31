@@ -13,6 +13,10 @@ This file is a DROP-IN replacement for edge_agent.py.
 import json
 import logging
 import os
+
+# Phase 24B idempotency ledger
+from edge_idempotency import claim as _idem_claim, mark_done as _idem_done
+
 import time
 import hmac
 import hashlib
@@ -33,10 +37,8 @@ BASE_URL = (
 EDGE_SECRET = os.getenv("EDGE_SECRET", "")
 AGENT_ID    = os.getenv("AGENT_ID", "edge-primary")
 
-EDGE_MODE = (os.getenv("EDGE_MODE", "live") or "live").strip().lower()   # "live" or "dryrun"
-if EDGE_MODE == "dry":
-    EDGE_MODE = "dryrun"
-EDGE_HOLD = (os.getenv("EDGE_HOLD","false") or "false").strip().lower() in ("1","true","yes","y","on")
+EDGE_MODE = os.getenv("EDGE_MODE", "live").lower()   # "live" or "dryrun"
+EDGE_HOLD = os.getenv("EDGE_HOLD", "false").lower() == "true"
 
 POLL_SECS = float(os.getenv("EDGE_POLL_SECS", "5"))
 TIMEOUT   = float(os.getenv("EDGE_HTTP_TIMEOUT", "15"))
