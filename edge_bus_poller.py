@@ -26,7 +26,9 @@ from typing import Dict, Any
 BASE_URL = os.getenv("BASE_URL", "http://localhost:10000")
 AGENT_ID = os.getenv("AGENT_ID", "edge-primary")
 SECRET   = os.getenv("EDGE_SECRET", "")
-EDGE_MODE = os.getenv("EDGE_MODE", "dry").lower()
+EDGE_MODE = (os.getenv("EDGE_MODE", "dry") or "dry").strip().lower()
+if EDGE_MODE == "dry":
+    EDGE_MODE = "dryrun"
 EDGE_HOLD = os.getenv("EDGE_HOLD", "false").lower() in ("1","true","yes")
 
 PULL_PERIOD = int(os.getenv("PULL_PERIOD_SECONDS", "8"))
