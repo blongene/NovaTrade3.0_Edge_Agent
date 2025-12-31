@@ -26,9 +26,7 @@ from typing import Dict, Any
 BASE_URL = os.getenv("BASE_URL", "http://localhost:10000")
 AGENT_ID = os.getenv("AGENT_ID", "edge-primary")
 SECRET   = os.getenv("EDGE_SECRET", "")
-EDGE_MODE = (os.getenv("EDGE_MODE", "dry") or "dry").strip().lower()
-if EDGE_MODE == "dry":
-    EDGE_MODE = "dryrun"
+EDGE_MODE = os.getenv("EDGE_MODE", "dry").lower()
 EDGE_HOLD = os.getenv("EDGE_HOLD", "false").lower() in ("1","true","yes")
 
 PULL_PERIOD = int(os.getenv("PULL_PERIOD_SECONDS", "8"))
@@ -36,6 +34,10 @@ LEASE_SECONDS = int(os.getenv("LEASE_SECONDS", "90"))
 MAX_PULL = int(os.getenv("EDGE_PULL_LIMIT", "3"))
 
 RECEIPTS_PATH = os.getenv("RECEIPTS_PATH", "./receipts.jsonl")
+
+# Phase 24B idempotency ledger (prevents double execution across restarts)
+from edge_idempotency import claim as _idem_claim, mark_done as _idem_done
+
 
 def _raw_json(d: Dict[str, Any]) -> str:
     return json.dumps(d, separators=(",", ":"))
