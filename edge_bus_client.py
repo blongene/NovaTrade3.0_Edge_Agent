@@ -297,24 +297,41 @@ _last_pull_log_ts = 0.0
 def pull(agent_id: str, limit: int = 5, log_every_s: int = 60) -> List[dict]:
     """
     Pull leased commands from Bus.
+
+    Improvements:
+      - Sends multiple agent keys for compatibility with mixed Bus implementations.
+      - Logs pull HTTP status + short response snippet (throttled) to diagnose 401/signature vs "no work".
     """
     global _last_pull_log_ts
 
+    aid = str(agent_id).strip()
+
     body = {
-        # Send ALL common agent keys for compatibility with older/newer Bus builds
-        "agent_id": str(agent_id).strip(),
-        "agent": str(agent_id).strip(),
-        "agent_target": str(agent_id).strip(),
-        "agentId": str(agent_id).strip(),
-    
+        # Compatibility keys (different Bus builds have used different fields)
+        "agent_id": aid,
+        "agent": aid,
+        "agent_target": aid,
+        "agentId": aid,
+
+        # Usual paging keys (also compat)
         "limit": int(limit),
         "max_items": int(limit),
         "n": int(limit),
+
         "ts": int(time.time()),
     }
 
     r = post_signed("/api/commands/pull", body)
-    data = None
+
+    # Always try to parse JSON, but keep the raw text snippet for diagnosis.
+    text_snip = ""
+    try:
+        text_snip = (r.text or "").strip().replace("\n", " ")
+        if len(text_snip) > 220:
+            text_snip = text_snip[:220] + "…"
+    except Exception:
+        text_snip = ""
+
     try:
         data = r.json()
     except Exception:
@@ -326,7 +343,11 @@ def pull(agent_id: str, limit: int = 5, log_every_s: int = 60) -> List[dict]:
     now = time.time()
     if log_every_s and (now - _last_pull_log_ts) >= float(log_every_s):
         _last_pull_log_ts = now
-        print(f"[edge_bus_client] pull ok={norm.get('ok')} n={len(cmds)}")
+        # This is the key diagnostic line:
+        print(
+            f"[edge_bus_client] pull http={getattr(r,'status_code',None)} "
+            f"ok={norm.get('ok')} n={len(cmds)} snip={text_snip}"
+        )
 
     return cmds
 
