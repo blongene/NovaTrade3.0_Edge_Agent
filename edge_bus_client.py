@@ -1,20 +1,38 @@
-# edge_bus_client.py
+# edge_bus_client.py — Signed client for Bus command endpoints
+#
+# Patch: tolerate multiple base-url env var names (BASE_URL, BUS_BASE_URL, CLOUD_BASE_URL, PUBLIC_BASE_URL)
+# and keep behavior identical otherwise.
+
 import os, json, hmac, hashlib, requests, time, random
+
 _last_pull_log_ts = 0.0  # rate-limit noisy transient errors
 
 # --------------------------------------------------------------------
 # Config (all overridable via env)
 # --------------------------------------------------------------------
+
+def _pick_env(*keys: str) -> str:
+    for k in keys:
+        v = (os.getenv(k) or "").strip()
+        if v:
+            return v
+    return ""
+
+
 def _base_url() -> str:
-    base = os.getenv("BASE_URL", "").strip()
+    # Prefer explicit BASE_URL, but allow the newer envs you already use.
+    base = _pick_env("BASE_URL", "BUS_BASE_URL", "CLOUD_BASE_URL", "PUBLIC_BASE_URL")
     if not (base.startswith("http://") or base.startswith("https://")):
-        raise RuntimeError(f"BASE_URL missing or invalid: {base!r}")
+        raise RuntimeError(
+            f"Bus base URL missing/invalid. Set BASE_URL (or BUS_BASE_URL/CLOUD_BASE_URL/PUBLIC_BASE_URL). Got: {base!r}"
+        )
     return base.rstrip("/")
 
+
 BASE_URL = _base_url()                                  # validated
-EDGE_SECRET = os.environ.get("EDGE_SECRET", "").strip() # required for HMAC
+EDGE_SECRET = (os.environ.get("EDGE_SECRET") or os.environ.get("OUTBOX_SECRET") or "").strip()  # required for HMAC
 if not EDGE_SECRET:
-    raise RuntimeError("EDGE_SECRET is not set")
+    raise RuntimeError("EDGE_SECRET is not set (must match Bus OUTBOX_SECRET)")
 
 # timeouts/backoff
 TIMEOUT  = float(os.environ.get("EDGE_HTTP_TIMEOUT_SECS", "12"))   # seconds (connect/read)
@@ -24,34 +42,36 @@ BACKOFF0 = float(os.environ.get("EDGE_HTTP_BACKOFF_SECS", "0.6"))  # base backof
 # --------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------
+
 def _canonical_json(d: dict) -> str:
-    # match Bus HMAC expectations
+    # Match Bus HMAC expectations: stable keys, compact separators
     return json.dumps(d, separators=(",", ":"), sort_keys=True)
+
 
 def _sign_raw(raw: str) -> str:
     return hmac.new(EDGE_SECRET.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
+
 
 def _retryable_status(code: int) -> bool:
     # retry on 5xx + 429
     return code == 429 or (500 <= code < 600)
 
+
 def _short_html(text: str, limit: int = 160) -> str:
-    # Collapse giant HTML error pages into a short single-line hint
-    t = text.strip()
+    t = (text or "").strip()
     if t.startswith("<!DOCTYPE") or t.startswith("<html"):
         return "HTML error page (e.g., 502)"
     if len(t) > limit:
         return t[:limit] + "…"
     return t
 
+
 # --------------------------------------------------------------------
 # Core signed POST with retries
 # --------------------------------------------------------------------
+
 def post_signed(path: str, body: dict, timeout: float | tuple | None = None) -> requests.Response:
-    """
-    Signed POST with automatic retries on 5xx/429 and connection issues.
-    Raises an HTTPError/ConnectionError/Timeout if all retries fail.
-    """
+    """Signed POST with automatic retries on 5xx/429 and connection issues."""
     url = f"{BASE_URL}{path}"
     raw = _canonical_json(body)
     sig = _sign_raw(raw)
@@ -69,7 +89,6 @@ def post_signed(path: str, body: dict, timeout: float | tuple | None = None) -> 
         try:
             r = requests.post(url, data=raw, headers=headers, timeout=timeout)
             if _retryable_status(r.status_code):
-                # fall through to backoff/retry
                 last_exc = requests.HTTPError(
                     f"{r.status_code} {_short_html(r.text)}", response=r
                 )
@@ -81,7 +100,6 @@ def post_signed(path: str, body: dict, timeout: float | tuple | None = None) -> 
             last_exc = e
 
         except requests.HTTPError as e:
-            # If not retryable, bubble immediately
             resp = getattr(e, "response", None)
             code = getattr(resp, "status_code", None)
             if code is None or not _retryable_status(code):
@@ -93,14 +111,15 @@ def post_signed(path: str, body: dict, timeout: float | tuple | None = None) -> 
         sleep_s += random.uniform(0, 0.25)
         time.sleep(min(sleep_s, 6.0))
 
-    # all attempts failed
     if last_exc:
         raise last_exc
     raise RuntimeError("post_signed failed without exception")
 
+
 # --------------------------------------------------------------------
-# Edge Bus convenience functions
+# Convenience
 # --------------------------------------------------------------------
+
 def pull(agent_id: str, limit: int = 1) -> dict:
     """Lease up to `limit` commands for this agent."""
     global _last_pull_log_ts
@@ -110,25 +129,23 @@ def pull(agent_id: str, limit: int = 1) -> dict:
         r = post_signed("/api/commands/pull", body)
         return r.json()
     except Exception as e:
-        # Don’t crash the loop – surface a clean, rate-limited message
         msg = getattr(e, "args", [str(e)])[0]
         code = getattr(getattr(e, "response", None), "status_code", None)
         now = time.time()
 
-        # Treat 5xx/HTML “502” pages as transient – log at most once per minute
         transient = (code in (502, 503, 504)) or ("HTML error page" in str(msg)) or ("<!DOCTYPE" in str(msg))
         if transient:
             if now - _last_pull_log_ts > 60:
                 print(f"[edge] WARN pull transient {code or ''}: {msg}")
                 _last_pull_log_ts = now
         else:
-            # real errors (auth, 4xx) should still be loud
             print(f"[edge] ERROR pull error: {msg}")
 
         return {"ok": False, "commands": [], "error": msg}
 
+
 def ack(agent_id: str, cmd_id: int | str, ok: bool, receipt: dict) -> dict:
-    """Acknowledge (and finalize if ok=True) a leased command with a normalized receipt."""
+    """Acknowledge a leased command with a normalized receipt."""
     body = {
         "agent_id": agent_id,
         "cmd_id": cmd_id,
