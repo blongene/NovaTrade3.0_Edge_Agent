@@ -90,6 +90,8 @@ CACHE_PATH = os.getenv(
 # Quotes we treat as “venue liquidity”
 QUOTES = ("USD", "USDC", "USDT")
 
+# Network / request timeouts
+REQ_TIMEOUT = float(os.getenv("TELEMETRY_REQ_TIMEOUT", "10"))
 
 # --------------------------------------------------------------------------- #
 # Canonical agent identity (trust boundary)
