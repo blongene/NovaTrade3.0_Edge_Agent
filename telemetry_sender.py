@@ -53,30 +53,28 @@ QUOTES = ("USD", "USDC", "USDT")
 def _resolve_agent_id() -> str:
     """
     Canonical identity is env-only.
-    Do NOT allow payload/cache to override agent identity.
-
     Priority:
-      1) EDGE_AGENT_ID (preferred)
-      2) AGENT_ID (legacy fallback)
+      1) AGENT_ID
+      2) EDGE_AGENT_ID
       3) "edge"
     """
-    agent = (os.getenv("EDGE_AGENT_ID") or os.getenv("AGENT_ID") or "edge").strip()
+    agent = (os.getenv("AGENT_ID") or os.getenv("EDGE_AGENT_ID") or "edge").strip()
     return agent or "edge"
 
 
 def _stamp_agent(payload: dict) -> dict:
-    """Force canonical agent identity onto any payload (including cache restores)."""
+    """
+    Force canonical agent identity onto any payload
+    (including cache restores).
+    """
     try:
+        agent = _resolve_agent_id()
         payload = payload or {}
-        payload["agent"] = _resolve_agent_id()
-        # Keep a compatible alias field if other parts read agent_id
-        if "agent_id" in payload and payload.get("agent_id") != payload["agent"]:
-            payload["agent_id"] = payload["agent"]
+        payload["agent"] = agent
+        payload["agent_id"] = agent  # compatibility alias
     except Exception:
-        # Best effort; never fail telemetry due to stamping
         pass
     return payload
-
 
 # --------------------------------------------------------------------------- #
 # HMAC + HTTP
