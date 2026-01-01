@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""edge_bus_poller.py — NovaTrade Edge → Bus poll/exec/ack loop
+"""edge_bus_poller.py — NovaTrade Edge → Bus poll/exec/ack loop (Phase 25C)
 
-This is the *safe*, production-shaped poller:
+Production goals:
 - No syntax errors
-- Uses edge_bus_client (signed) with retries
+- Uses edge_bus_client (signed) with retries + auth fallback
 - Idempotent via receipts.jsonl (won't double-execute a command already ACKed ok)
 - Minimal logs
 - Honors EDGE_HOLD and EDGE_MODE
 
 Env (Edge):
   BUS_BASE_URL or CLOUD_BASE_URL or BASE_URL  (preferred: BUS_BASE_URL)
-  EDGE_SECRET (must match Bus OUTBOX_SECRET)
+  OUTBOX_SECRET or EDGE_SECRET (must match what Bus expects for /api/commands/*)
   AGENT_ID (or EDGE_AGENT_ID)
   EDGE_MODE=live|dryrun|dry
   EDGE_HOLD=true|false
   EDGE_PULL_LIMIT (default 3)
   PULL_PERIOD_SECONDS (default 10)
 
-Execution:
+Run:
   python -m edge_bus_poller
 """
 
@@ -54,7 +54,6 @@ def _append_receipt(line: Dict[str, Any]) -> None:
         with open(RECEIPTS_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(line, ensure_ascii=False) + "\n")
     except Exception:
-        # never crash loop because disk is weird
         pass
 
 
@@ -88,7 +87,6 @@ def _ack_err(cmd_id: str, err: str, extras: Dict[str, Any] | None = None) -> Non
         res = ack(AGENT_ID, cmd_id, False, payload)
         _append_receipt({"ts": int(time.time()), "command_id": str(cmd_id), "status": "err", "ack": res, "error": err})
     except Exception:
-        # don't spin/log too much
         _append_receipt({"ts": int(time.time()), "command_id": str(cmd_id), "status": "err", "error": err})
 
 
@@ -118,11 +116,9 @@ def _execute(cmd: Dict[str, Any]) -> None:
     if not cid:
         return
 
-    # idempotency: if we already ACKed ok in the local receipts ledger, skip.
     if _seen_ok(cid):
         return
 
-    # Holds + dry modes are *SIMULATED* and still ACK ok (so the command leaves the outbox)
     if EDGE_HOLD:
         _ack_ok(cid, _simulate_receipt(cmd, reason="EDGE_HOLD"))
         return
@@ -136,10 +132,7 @@ def _execute(cmd: Dict[str, Any]) -> None:
         _ack_ok(cid, _simulate_receipt(cmd, reason=f"mode={EDGE_MODE}, intent_mode={mode}"))
         return
 
-    # Live execution: hand off to your existing router/executors.
-    # We keep this robust: if anything fails, ACK error once.
     try:
-        # Prefer the existing policy-aware executor if present.
         try:
             from edge_policy_aware_executor import execute_intent as _exec
         except Exception:
@@ -151,7 +144,6 @@ def _execute(cmd: Dict[str, Any]) -> None:
         intent = cmd.get("intent") or {}
         receipt = _exec(intent)
 
-        # Expect a normalized receipt dict; if executor returns plain dict, wrap softly.
         if isinstance(receipt, dict) and ("normalized" in receipt):
             norm = receipt
         else:
@@ -165,12 +157,7 @@ def _execute(cmd: Dict[str, Any]) -> None:
 
 
 def poll_once() -> int:
-    try:
-        res = pull(AGENT_ID, MAX_PULL)
-    except Exception as e:
-        # edge_bus_client already rate-limits transient logs; keep quiet here.
-        return 0
-
+    res = pull(AGENT_ID, MAX_PULL)
     cmds: List[Dict[str, Any]] = (res or {}).get("commands") or []
     if not cmds:
         return 0
@@ -182,12 +169,7 @@ def poll_once() -> int:
 
 
 def run_forever() -> None:
-    # One clean startup line
-    try:
-        base = _pick_env("BASE_URL", "BUS_BASE_URL", "CLOUD_BASE_URL", "PUBLIC_BASE_URL", default="")
-    except Exception:
-        base = ""
-
+    base = _pick_env("BASE_URL", "BUS_BASE_URL", "CLOUD_BASE_URL", "PUBLIC_BASE_URL", default="")
     print(f"[edge] bus poller online — agent={AGENT_ID} mode={EDGE_MODE} hold={EDGE_HOLD} base={base}")
 
     while True:
