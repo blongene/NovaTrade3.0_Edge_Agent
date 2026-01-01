@@ -1,70 +1,62 @@
 #!/usr/bin/env python3
+"""edge_bus_poller.py — NovaTrade Edge → Bus poll/exec/ack loop
+
+This is the *safe*, production-shaped poller:
+- No syntax errors
+- Uses edge_bus_client (signed) with retries
+- Idempotent via receipts.jsonl (won't double-execute a command already ACKed ok)
+- Minimal logs
+- Honors EDGE_HOLD and EDGE_MODE
+
+Env (Edge):
+  BUS_BASE_URL or CLOUD_BASE_URL or BASE_URL  (preferred: BUS_BASE_URL)
+  EDGE_SECRET (must match Bus OUTBOX_SECRET)
+  AGENT_ID (or EDGE_AGENT_ID)
+  EDGE_MODE=live|dryrun|dry
+  EDGE_HOLD=true|false
+  EDGE_PULL_LIMIT (default 3)
+  PULL_PERIOD_SECONDS (default 10)
+
+Execution:
+  python -m edge_bus_poller
 """
-edge_bus_poller.py — NovaTrade Edge → Bus poll/exec/ack loop
 
-• Pulls signed commands from Bus (/api/commands/pull)
-• Executes orders (live or dry-run) with simple venue router
-• Acks results (/api/commands/ack) with HMAC
-• Idempotent (receipts.jsonl) so duplicate pulls don’t double-execute
-• Honors EDGE_HOLD (skip) and EDGE_MODE=dry|live
+from __future__ import annotations
 
-Environment (Edge worker):
-  BASE_URL=https://novatrade3-0.onrender.com
-  AGENT_ID=edge-primary
-  OUTBOX_SECRET=...            # must match Bus
-  EDGE_MODE=live|dry           # default dry
-  EDGE_HOLD=false|true         # default false
-  PULL_PERIOD_SECONDS=8
-  LEASE_SECONDS=90
-  MAX_CMDS_PER_PULL=5
-  # Venue API keys loaded by your existing local executors (optional)
-"""
+import json
+import os
+import time
+import traceback
+from typing import Any, Dict, List
 
-import os, time, json, hmac, hashlib, requests, threading
-from typing import Dict, Any
-
-BASE_URL = os.getenv("BASE_URL", "http://localhost:10000")
-AGENT_ID = os.getenv("AGENT_ID", "edge-primary")
-SECRET   = os.getenv("EDGE_SECRET", "")
-EDGE_MODE = os.getenv("EDGE_MODE", "dry").lower()
-EDGE_HOLD = os.getenv("EDGE_HOLD", "false").lower() in ("1","true","yes")
-
-PULL_PERIOD = int(os.getenv("PULL_PERIOD_SECONDS", "8"))
-LEASE_SECONDS = int(os.getenv("LEASE_SECONDS", "90"))
-MAX_PULL = int(os.getenv("EDGE_PULL_LIMIT", "3"))
-
-RECEIPTS_PATH = os.getenv("RECEIPTS_PATH", "./receipts.jsonl")
-
-# Phase 24B idempotency ledger (prevents double execution across restarts)
-from edge_idempotency import claim as _idem_claim, mark_done as _idem_done
+from edge_bus_client import pull, ack
 
 
-def _raw_json(d: Dict[str, Any]) -> str:
-    return json.dumps(d, separators=(",", ":"))
+def _pick_env(*keys: str, default: str = "") -> str:
+    for k in keys:
+        v = (os.getenv(k) or "").strip()
+        if v:
+            return v
+    return default
 
-def _sign_raw(d: Dict[str, Any]) -> str:
-    if not SECRET:
-        return ""
-    raw = _raw_json(d)
-    return hmac.new(SECRET.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
 
-def _post(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    raw = _raw_json(body)                  # exact string we will send
-    sig = _sign_raw(body)
-    headers = {
-        "Content-Type": "application/json",
-        "X-Nova-Signature": sig,          # header Bus verifies
-    }
-    r = requests.post(f"{BASE_URL}{path}", data=raw, headers=headers, timeout=15)
-    r.raise_for_status()
-    return r.json()
-  
+AGENT_ID = _pick_env("AGENT_ID", "EDGE_AGENT_ID", default="edge-primary")
+EDGE_MODE = _pick_env("EDGE_MODE", default="dry").lower()
+EDGE_HOLD = _pick_env("EDGE_HOLD", default="false").lower() in {"1", "true", "yes"}
+
+PULL_PERIOD = int(_pick_env("PULL_PERIOD_SECONDS", default="10"))
+MAX_PULL = int(_pick_env("EDGE_PULL_LIMIT", default="3"))
+RECEIPTS_PATH = _pick_env("RECEIPTS_PATH", default="./receipts.jsonl")
+
+
 def _append_receipt(line: Dict[str, Any]) -> None:
     try:
         with open(RECEIPTS_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(line, ensure_ascii=False) + "\n")
     except Exception:
+        # never crash loop because disk is weird
         pass
+
 
 def _seen_ok(command_id: str) -> bool:
     try:
@@ -72,147 +64,145 @@ def _seen_ok(command_id: str) -> bool:
             for ln in f:
                 try:
                     j = json.loads(ln)
-                    if j.get("command_id")==command_id and j.get("status")=="ok":
+                    if str(j.get("command_id")) == str(command_id) and j.get("status") == "ok":
                         return True
                 except Exception:
                     continue
     except FileNotFoundError:
         return False
+    except Exception:
+        return False
     return False
 
-# ---------- venue executors (plug in your real ones here) ----------
-def _exec_live(venue: str, symbol: str, side: str, amount: float) -> Dict[str, Any]:
-    """
-    Replace these try/except blocks with your real adapters.
-    Must be FAST (<= ~2-3s) to avoid lease expiry; increase LEASE_SECONDS if needed.
-    Return dict detail suitable for ACK (ids, fills, cost, etc.)
-    """
-    venue = venue.upper()
+
+def _ack_ok(cmd_id: str, receipt: Dict[str, Any]) -> None:
+    res = ack(AGENT_ID, cmd_id, True, receipt)
+    _append_receipt({"ts": int(time.time()), "command_id": str(cmd_id), "status": "ok", "ack": res})
+
+
+def _ack_err(cmd_id: str, err: str, extras: Dict[str, Any] | None = None) -> None:
+    payload: Dict[str, Any] = {"error": err}
+    if extras:
+        payload.update(extras)
     try:
-        if venue == "BINANCEUS":
-            # from binanceus_executor import place_order
-            oid = f"binanceus-{int(time.time())}"
-            return {"venue":"BINANCEUS","order_id":oid,"symbol":symbol,"side":side,"amount":amount}
-        elif venue == "COINBASE":
-            # from coinbase_executor import place_order
-            oid = f"coinbase-{int(time.time())}"
-            return {"venue":"COINBASE","order_id":oid,"symbol":symbol,"side":side,"amount":amount}
-        elif venue == "KRAKEN":
-            # from kraken_executor import place_order
-            # oid = place_order(symbol, side, amount)
-            oid = f"kraken-{int(time.time())}"
-            return {"venue":"KRAKEN","order_id":oid,"symbol":symbol,"side":side,"amount":amount}
-        else:
-            raise RuntimeError(f"unknown venue {venue}")
-    except Exception as e:
-        raise RuntimeError(f"execution failed: {e}")
+        res = ack(AGENT_ID, cmd_id, False, payload)
+        _append_receipt({"ts": int(time.time()), "command_id": str(cmd_id), "status": "err", "ack": res, "error": err})
+    except Exception:
+        # don't spin/log too much
+        _append_receipt({"ts": int(time.time()), "command_id": str(cmd_id), "status": "err", "error": err})
 
-def _exec_dry(venue: str, symbol: str, side: str, amount: float) -> Dict[str, Any]:
+
+def _simulate_receipt(cmd: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    intent = cmd.get("intent") or {}
+    venue = (intent.get("venue") or "").upper()
+    symbol = (intent.get("symbol") or "").upper()
+    side = (intent.get("side") or "").lower()
+    amount = float(intent.get("amount") or 0.0)
+
     return {
-        "venue": venue.upper(),
-        "dry_run": True,
-        "symbol": symbol.upper(),
-        "side": side.lower(),
-        "amount": float(amount),
-        "ts": int(time.time()),
-    }
-
-# ---------- core loop ----------
-from edge_bus_client import pull, ack
-
-res = pull(AGENT_ID, 1)
-cmds = (res or {}).get("commands") or []
-if not cmds:
-    # nothing leased (or transient error) – just sleep and loop
-    time.sleep(POLL_SECS)
-    continue
-
-def ack_success(agent_id: str, cmd_id: int | str, venue: str, symbol: str, side: str,
-                executed_qty: float, avg_price: float, extras: dict | None = None):
-    receipt = {
         "normalized": {
-            "receipt_id": f"{agent_id}:{cmd_id}",
+            "receipt_id": f"{AGENT_ID}:{cmd.get('id')}",
             "venue": venue,
             "symbol": symbol,
             "side": side,
-            "executed_qty": executed_qty,
-            "avg_price": avg_price,
-            "status": "FILLED",
+            "executed_qty": amount,
+            "avg_price": 0.0,
+            "status": "SIMULATED",
+            "reason": reason,
         }
     }
-    if extras:  # fee, order_id, txid, quote_spent, etc.
-        receipt["normalized"].update(extras)
-    return ack(agent_id, cmd_id, True, receipt)
 
-def ack_error(agent_id: str, cmd_id: int | str, message: str, extras: dict | None = None):
-    receipt = {"error": message}
-    if extras:
-        receipt.update(extras)
-    return ack(agent_id, cmd_id, False, receipt)
 
-  
-def poll_once():
-    if EDGE_HOLD:
-        print("[edge] hold=True; skipping poll")
+def _execute(cmd: Dict[str, Any]) -> None:
+    cid = str(cmd.get("id"))
+    if not cid:
         return
+
+    # idempotency: if we already ACKed ok in the local receipts ledger, skip.
+    if _seen_ok(cid):
+        return
+
+    # Holds + dry modes are *SIMULATED* and still ACK ok (so the command leaves the outbox)
+    if EDGE_HOLD:
+        _ack_ok(cid, _simulate_receipt(cmd, reason="EDGE_HOLD"))
+        return
+
+    mode = (cmd.get("intent") or {}).get("mode")
+    mode = (str(mode).lower() if mode else EDGE_MODE)
+    if mode not in {"live", "dry", "dryrun"}:
+        mode = EDGE_MODE
+
+    if EDGE_MODE != "live" or mode != "live":
+        _ack_ok(cid, _simulate_receipt(cmd, reason=f"mode={EDGE_MODE}, intent_mode={mode}"))
+        return
+
+    # Live execution: hand off to your existing router/executors.
+    # We keep this robust: if anything fails, ACK error once.
+    try:
+        # Prefer the existing policy-aware executor if present.
+        try:
+            from edge_policy_aware_executor import execute_intent as _exec
+        except Exception:
+            _exec = None
+
+        if _exec is None:
+            raise RuntimeError("No executor available (edge_policy_aware_executor.execute_intent missing)")
+
+        intent = cmd.get("intent") or {}
+        receipt = _exec(intent)
+
+        # Expect a normalized receipt dict; if executor returns plain dict, wrap softly.
+        if isinstance(receipt, dict) and ("normalized" in receipt):
+            norm = receipt
+        else:
+            norm = {"normalized": receipt or {"status": "FILLED"}}
+
+        _ack_ok(cid, norm)
+
+    except Exception as e:
+        tb = "".join(traceback.format_exception_only(type(e), e)).strip()
+        _ack_err(cid, f"execute_failed: {tb}")
+
+
+def poll_once() -> int:
     try:
         res = pull(AGENT_ID, MAX_PULL)
     except Exception as e:
-        print(f"[edge] pull error: {e}")
-        return
+        # edge_bus_client already rate-limits transient logs; keep quiet here.
+        return 0
 
     cmds: List[Dict[str, Any]] = (res or {}).get("commands") or []
     if not cmds:
-        return
-    print(f"[edge] received {len(cmds)} command(s)")
+        return 0
+
     for c in cmds:
-        try:
-            _execute(c)
-        except Exception as e:
-            cid = str(c.get("id", "?"))
-            tb = "".join(traceback.format_exception_only(type(e), e)).strip()
-            try:
-                ack(AGENT_ID, cid, False, {"error": f"unhandled: {tb}"})
-            except Exception:
-                pass
+        _execute(c)
 
-def _execute(cmd: Dict[str, Any]) -> None:
-    cid = cmd["id"]
-    intent = cmd.get("intent", {})
-    venue  = (intent.get("venue") or "").upper()
-    symbol = (intent.get("symbol") or "").upper()
-    side   = (intent.get("side") or "").lower()
-    amount = float(intent.get("amount") or 0.0)
+    return len(cmds)
 
-    # … call your venue executor(s) here …
-    # detail should be a dict with normalized receipt:
-    detail = {"normalized":{
-        "receipt_id": f"{AGENT_ID}:{cid}",
-        "venue": venue,
-        "symbol": symbol,
-        "side": side,
-        "executed_qty": amount,
-        "avg_price": 0.0,   # fill from executor
-        "status": "FILLED" if EDGE_MODE=="live" else "SIMULATED",
-    }}
 
-    ok = True
-    ack_success(AGENT_ID, cid, venue, symbol, side, executed_qty=amount, avg_price=price, extras={"order_id": oid})
+def run_forever() -> None:
+    # One clean startup line
+    try:
+        base = _pick_env("BASE_URL", "BUS_BASE_URL", "CLOUD_BASE_URL", "PUBLIC_BASE_URL", default="")
+    except Exception:
+        base = ""
 
-    # On error:
-    ack_error(AGENT_ID, cid, f"price fetch failed: {err}", {"venue": venue, "symbol": symbol})
+    print(f"[edge] bus poller online — agent={AGENT_ID} mode={EDGE_MODE} hold={EDGE_HOLD} base={base}")
 
-def run_forever():
-    print(f"[edge] bus poller online — agent={AGENT_ID} mode={EDGE_MODE} hold={EDGE_HOLD} base={BASE_URL}")
     while True:
         poll_once()
         time.sleep(PULL_PERIOD)
 
-# For import-as-thread usage in your existing edge_agent.py
+
 def start_bus_poller():
+    # Back-compat helper if edge_agent imports this
+    import threading
+
     t = threading.Thread(target=run_forever, name="bus-poller", daemon=True)
     t.start()
     return t
+
 
 if __name__ == "__main__":
     run_forever()
