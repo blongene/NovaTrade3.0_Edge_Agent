@@ -1,13 +1,26 @@
-# telemetry_sender.py — Edge -> Bus balances (push-on-boot + periodic + backoff)
-import os
-import json
-import time
-import hmac
-import hashlib
-import threading
-from typing import Dict, Any, Tuple, Optional, List
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def _resolve_agent_id() -> str:
+    """
+    Canonical agent id to use for telemetry.
+    Priority: EDGE_AGENT_ID -> AGENT_ID -> AGENT -> "edge"
+    """
+    return (os.getenv("EDGE_AGENT_ID") or os.getenv("AGENT_ID") or os.getenv("AGENT") or "edge").strip() or "edge"
 
-import requests
+
+def _canonical_json_bytes(obj: dict) -> bytes:
+    """
+    IMPORTANT: We sign the *exact bytes* we send to the Bus.
+
+    The Bus verifier typically HMACs the raw request body (request.get_data()).
+    If we let requests/json serialize independently, minor whitespace / key-order
+    differences can break signatures. We therefore:
+      - sort_keys=True
+      - compact separators
+      - UTF-8 encoding
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 def _hmac_sha256_hex(secret: str, body_bytes: bytes) -> str:
@@ -29,54 +42,22 @@ def _auth_headers(secret: str, body_bytes: bytes) -> dict:
     }
 
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
-def _resolve_agent_id() -> str:
-    """
-    Canonical agent id to use for telemetry.
-    Priority: EDGE_AGENT_ID -> AGENT_ID -> AGENT -> "edge"
-    """
-    return (os.getenv("EDGE_AGENT_ID") or os.getenv("AGENT_ID") or os.getenv("AGENT") or "edge").strip() or "edge"
+# telemetry_sender.py — Edge -> Bus balances (push-on-boot + periodic + backoff)
+import os
+import json
+import time
+import hmac
+import hashlib
+import threading
+from typing import Dict, Any, Tuple, Optional, List
 
-
-def _canonical_json_bytes(obj: dict) -> bytes:
-    """
-    IMPORTANT: We sign the *exact bytes* we send to the Bus.
-
-    We serialize deterministically to avoid signature mismatch:
-      - compact separators
-      - sort_keys=True
-      - ensure_ascii=False (preserve unicode)
-    """
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-
-
-def _stamp_agent(payload: dict) -> dict:
-    """
-    Ensure telemetry payload includes canonical agent id fields.
-    """
-    agent = _resolve_agent_id()
-    out = dict(payload or {})
-    out.setdefault("agent_id", agent)
-    # Some Bus code expects 'agent' too; keep both for compatibility.
-    out.setdefault("agent", agent)
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# Configuration
-# --------------------------------------------------------------------------- #
+import requests
 
 # Base URL for the Bus (NovaTrade 3.0 cloud)
 BUS_BASE = (os.getenv("CLOUD_BASE_URL") or os.getenv("BUS_BASE_URL", "") or "").rstrip("/")
 
-# HMAC secrets (tolerant selection happens at send-time)
-TELEMETRY_SECRET = (os.getenv("TELEMETRY_SECRET") or "").strip()
-EDGE_SECRET = (os.getenv("EDGE_SECRET") or "").strip()
-OUTBOX_SECRET = (os.getenv("OUTBOX_SECRET") or "").strip()
-# Prefer TELEMETRY_SECRET for telemetry endpoints; fall back to EDGE/OUTBOX for tolerance.
-SIGNING_SECRET = TELEMETRY_SECRET or EDGE_SECRET or OUTBOX_SECRET
+# HMAC secret shared with the Bus (wsgi.py /api/telemetry/push_balances)
+TELEM_SECRET = os.getenv("TELEMETRY_SECRET", "")
 
 # Telemetry snapshot logging controls
 TELEM_DEBUG = (os.getenv("TELEMETRY_SUMMARY_ENABLED") or "1").lower() in {
@@ -92,12 +73,19 @@ TELEM_DEBUG_DUMP = (os.getenv("TELEMETRY_DEBUG_DUMP") or "0").lower() in {
     "on",
 }
 
-# Which venue assets we push (optional allowlist)
-PUSH_VENUES = os.getenv("PUSH_VENUES", "").strip()  # e.g. "BINANCEUS,COINBASE,KRAKEN"
-PUSH_ASSETS = os.getenv("PUSH_ASSETS", "").strip()  # e.g. "USD,USDT,USDC,BTC"
+# Which assets to highlight in the log snapshot
+HEADLINE = ("USDT", "USDC", "USD", "BTC", "ETH")
 
-# Local cache path (so Bus always has *something* after deploys)
-CACHE_PATH = os.getenv("EDGE_LAST_BALANCES_PATH", os.path.expanduser("~/.nova/last_balances.json"))
+PUSH_IVL = int(os.getenv("PUSH_BALANCES_INTERVAL_SECS", "120"))
+HEARTBEAT_ON_BOOT = (os.getenv("PUSH_BALANCES_ON_BOOT") or "1").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+CACHE_PATH = os.getenv(
+    "EDGE_LAST_BALANCES_PATH", os.path.expanduser("~/.nova/last_balances.json")
+)
 
 # Quotes we treat as “venue liquidity”
 QUOTES = ("USD", "USDC", "USDT")
@@ -105,21 +93,52 @@ QUOTES = ("USD", "USDC", "USDT")
 # Network / request timeouts
 REQ_TIMEOUT = float(os.getenv("TELEMETRY_REQ_TIMEOUT", "10"))
 
-
 # --------------------------------------------------------------------------- #
 # Canonical agent identity (trust boundary)
 # --------------------------------------------------------------------------- #
-def _log(msg: str) -> None:
-    if TELEM_DEBUG:
-        print(f"[telemetry_sender] {msg}")
+
+def _stamp_agent(payload: dict) -> dict:
+    """
+    Force canonical agent identity onto any payload
+    (including cache restores).
+    """
+    try:
+        agent = _resolve_agent_id()
+        payload = payload or {}
+        payload["agent"] = _resolve_agent_id()
+        payload["agent_id"] = _resolve_agent_id()
+    except Exception:
+        pass
+    return payload
+
+# --------------------------------------------------------------------------- #
+# HMAC + HTTP
+# --------------------------------------------------------------------------- #
+def _hmac_sig(raw: bytes) -> str:
+    if not TELEM_SECRET:
+        return ""
+    return hmac.new(TELEM_SECRET.encode(), raw, hashlib.sha256).hexdigest()
 
 
-def _dump(obj: Any) -> None:
-    if TELEM_DEBUG_DUMP:
-        try:
-            print("[telemetry_sender] dump:", json.dumps(obj, indent=2, sort_keys=True)[:4000])
-        except Exception:
-            pass
+def _post_json(path: str, payload: dict) -> Tuple[int, str]:
+    if not BUS_BASE:
+        return 0, "BUS_BASE not configured"
+
+    # Enforce canonical agent ID at send-time too (defense in depth)
+    payload = _stamp_agent(payload)
+
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+    sig = _hmac_sig(raw)
+
+    headers = {"Content-Type": "application/json"}
+    if sig:
+        # send both for compatibility with Bus
+        headers["X-TELEMETRY-SIGN"] = sig
+        headers["X-NT-Sig"] = sig
+
+    url = f"{BUS_BASE}{path}"
+    r = requests.post(url, data=raw, headers=headers, timeout=10)
+    return r.status_code, r.text
 
 
 # --------------------------------------------------------------------------- #
@@ -138,8 +157,7 @@ def _load_cache() -> Optional[dict]:
 
 def _save_cache(obj: dict) -> None:
     try:
-        # Avoid makedirs("") if a bare filename is provided
-        (_d := os.path.dirname(CACHE_PATH)) and os.makedirs(_d, exist_ok=True)
+        os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
         with open(CACHE_PATH, "w", encoding="utf-8") as f:
             json.dump(obj, f, separators=(",", ":"))
     except Exception:
@@ -153,210 +171,294 @@ def _save_cache(obj: dict) -> None:
 def _env_list(*names: str) -> List[str]:
     """
     Return first non-empty comma-separated env list among names.
-    Normalizes to uppercased trimmed values.
+    Normalizes to uppercase, strips blanks.
     """
-    for n in names:
-        raw = (os.getenv(n) or "").strip()
+    for nm in names:
+        raw = (os.getenv(nm, "") or "").strip()
         if raw:
             return [x.strip().upper() for x in raw.split(",") if x.strip()]
     return []
 
 
-def _filter_balances(bals: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+def _required_venues(by_venue_raw: Dict[str, Any]) -> List[str]:
     """
-    Apply optional allowlists from env.
+    Stable required venues list:
+      1) VENUE_ORDER (Edge explicit)
+      2) TELEMETRY_REQUIRED_VENUES (Bus-style)
+      3) ROUTER_ALLOWED / VENUES_ALLOWED (Edge router style)
+      4) fallback default (keeps Bus happy)
     """
-    venues_allow = set(_env_list("PUSH_VENUES", "TELEMETRY_VENUES"))
-    assets_allow = set(_env_list("PUSH_ASSETS", "TELEMETRY_ASSETS"))
+    venue_order = _env_list("VENUE_ORDER")
+    if venue_order:
+        return venue_order
 
-    out: Dict[str, Dict[str, float]] = {}
-    for venue, mp in (bals or {}).items():
-        v = (venue or "").upper()
-        if venues_allow and v not in venues_allow:
+    req = _env_list("TELEMETRY_REQUIRED_VENUES")
+    if req:
+        return req
+
+    allowed = _env_list("ROUTER_ALLOWED", "ROUTER_ALLOWED_VENUES", "VENUES_ALLOWED")
+    if allowed:
+        return allowed
+
+    # fallback (NovaTrade core 3)
+    return ["BINANCEUS", "KRAKEN", "COINBASE"]
+
+
+# --------------------------------------------------------------------------- #
+# Balance collection
+# --------------------------------------------------------------------------- #
+def _collect_balances() -> dict:
+    """
+    Uses existing Edge executors to collect balances.
+
+    Returns the Bus-friendly shape:
+      {agent, by_venue: {VENUE:{USD:..,USDC:..,USDT:..}}, flat:{BTC:..,ETH:..,...}, ts, errors?}
+
+    HARDENING (important):
+      - Always includes required venues (VENUE_ORDER/TELEMETRY_REQUIRED_VENUES/ROUTER_ALLOWED)
+      - Missing venues get zero-quote placeholders (truthful + prevents Bus gating)
+      - Emits payload["errors"] with concise root cause keys if collection fails
+      - Canonical agent identity is enforced (env-only)
+    """
+    agent = _resolve_agent_id()
+    ts = int(time.time())
+
+    errors: Dict[str, str] = {}
+
+    # venue->asset balances (dict[str, dict[str,float]])
+    by_venue_raw: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        # Preferred: module that already gathers all venues
+        from executors.binance_us_executor import get_balances as _edge_get_balances  # type: ignore
+
+        by_venue_raw = _edge_get_balances() or {}
+    except Exception as e:
+        errors["BALANCE_COLLECT"] = str(e)[:220]
+
+        # Fallback: try coinbase directly if available, and leave others out
+        try:
+            from executors.coinbase_advanced_executor import CoinbaseCDP  # type: ignore
+
+            by_venue_raw["COINBASE"] = CoinbaseCDP().balances()
+        except Exception as ee:
+            errors["COINBASE_FALLBACK"] = str(ee)[:220]
+
+        if TELEM_DEBUG:
+            print(f"[telemetry] get_balances() error; using COINBASE-only fallback: {e}")
+
+    # Optional debug: show what we actually got back per venue (quotes only)
+    if TELEM_DEBUG or TELEM_DEBUG_DUMP:
+        try:
+            dbg_bits = []
+            for venue, assets in (by_venue_raw or {}).items():
+                if not isinstance(assets, dict):
+                    continue
+                pieces = []
+                for q in QUOTES:
+                    if q in assets:
+                        try:
+                            pieces.append(f"{q}={float(assets[q] or 0):.6f}")
+                        except Exception:
+                            pieces.append(f"{q}=?")
+                dbg_bits.append(f"{venue}:{','.join(pieces) or 'no-quotes'}")
+            if dbg_bits:
+                print(f"[telemetry] raw balances venues={len(by_venue_raw)} " + " | ".join(dbg_bits))
+            else:
+                print("[telemetry] raw balances EMPTY from get_balances()")
+        except Exception as e:
+            errors["DEBUG_SUMMARY"] = str(e)[:220]
+            print(f"[telemetry] debug summary failed: {e}")
+
+    # Normalize into by_venue (only quote assets) and flat (sum of base assets across venues)
+    by_venue: Dict[str, Dict[str, float]] = {}
+    flat: Dict[str, float] = {}
+
+    for venue, assets in (by_venue_raw or {}).items():
+        if not isinstance(assets, dict):
             continue
-        if not isinstance(mp, dict):
+
+        vkey = (venue or "").upper().strip()
+        if not vkey:
             continue
-        filtered: Dict[str, float] = {}
-        for asset, amt in mp.items():
-            a = (asset or "").upper()
-            if assets_allow and a not in assets_allow:
-                continue
+
+        v_out: Dict[str, float] = {}
+
+        for asset, amt in assets.items():
             try:
-                filtered[a] = float(amt or 0.0)
+                a = (asset or "").upper().strip()
+                x = float(amt or 0.0)
             except Exception:
-                filtered[a] = 0.0
-        if filtered:
-            out[v] = filtered
-    return out
+                continue
+
+            if not a:
+                continue
+
+            if a in QUOTES:
+                v_out[a] = v_out.get(a, 0.0) + x
+            else:
+                flat[a] = flat.get(a, 0.0) + x
+
+        # Keep quote balances if present (otherwise we may still add placeholders below)
+        if v_out:
+            by_venue[vkey] = v_out
+
+    # Ensure required venues are present (zero placeholders are OK / truthful)
+    required = _required_venues(by_venue_raw)
+
+    for v in required:
+        v = (v or "").upper().strip()
+        if not v:
+            continue
+
+        if v not in by_venue:
+            by_venue[v] = {q: 0.0 for q in QUOTES}
+        else:
+            for q in QUOTES:
+                by_venue[v].setdefault(q, 0.0)
+
+    payload: Dict[str, Any] = {"agent": agent, "by_venue": by_venue, "flat": flat, "ts": ts}
+    if errors:
+        payload["errors"] = errors
+
+    # Enforce canonical agent once more
+    payload = _stamp_agent(payload)
+    return payload
 
 
 # --------------------------------------------------------------------------- #
-# HMAC + HTTP
+# Human-readable summary for Edge logs
 # --------------------------------------------------------------------------- #
-def _resolve_bus_base() -> str:
-    return (os.getenv("CLOUD_BASE_URL") or os.getenv("BUS_BASE_URL") or os.getenv("BASE_URL") or "").rstrip("/")
-
-
-def _resolve_signing_secret() -> str:
-    # Prefer TELEMETRY_SECRET for telemetry endpoints, but tolerate EDGE/OUTBOX for
-    # backwards compatibility / phased migrations.
-    return (os.getenv("TELEMETRY_SECRET") or os.getenv("EDGE_SECRET") or os.getenv("OUTBOX_SECRET") or "").strip()
-
-
-def _post_json(path: str, payload: dict) -> Tuple[int, str]:
-    """POST signed JSON to Bus with deterministic serialization and compatible headers.
-
-    - Uses canonical JSON bytes for signing (sort_keys=True, compact separators)
-    - Sends the signature under multiple header names the Bus may accept
-    - Returns (status_code, response_text) and never raises
+def _summarize_snapshot(payload: dict) -> str:
     """
-    base = _resolve_bus_base()
-    if not base:
-        return 0, "BUS_BASE not configured (CLOUD_BASE_URL/BUS_BASE_URL/BASE_URL)"
+    Build a compact human-readable snapshot for logs.
 
-    secret = _resolve_signing_secret()
-    if not secret:
-        return 0, "No signing secret set (TELEMETRY_SECRET/EDGE_SECRET/OUTBOX_SECRET)"
+    Example:
+        agent=edge-primary BINANCEUS:USDT=123.45,USD=10.00 | COINBASE:USDC=19.30 errors=COINBASE_FALLBACK || flat:BTC=0.015
+    """
+    try:
+        # Env-only identity (never payload override)
+        agent = _resolve_agent_id()
 
-    # Enforce canonical agent ID at send-time too (defense in depth)
+        by_venue = payload.get("by_venue") or {}
+        flat = payload.get("flat") or {}
+        errs = payload.get("errors") or {}
+
+        parts = []
+        for venue, amap in sorted(by_venue.items()):
+            if not isinstance(amap, dict):
+                continue
+            bits = []
+            for asset in HEADLINE:
+                if asset in amap:
+                    try:
+                        bits.append(f"{asset}={float(amap[asset]):.2f}")
+                    except Exception:
+                        pass
+            label = venue
+            if bits:
+                parts.append(f"{label}:" + ",".join(bits))
+            else:
+                parts.append(f"{label}:<no headline quotes>")
+
+        flat_bits = []
+        for asset in HEADLINE:
+            if asset in flat:
+                try:
+                    flat_bits.append(f"{asset}={float(flat[asset]):.4f}")
+                except Exception:
+                    pass
+
+        tail = ""
+        if flat_bits:
+            tail = " || flat:" + ",".join(flat_bits)
+
+        err_tail = ""
+        if isinstance(errs, dict) and errs:
+            try:
+                err_tail = " errors=" + ",".join(sorted([str(k) for k in errs.keys()]))
+            except Exception:
+                err_tail = " errors=1"
+
+        core = " | ".join(parts) if parts else "no venues"
+        return f"agent={agent} {core}{err_tail}{tail}"
+    except Exception as e:
+        return f"(summary-error: {e})"
+
+
+# --------------------------------------------------------------------------- #
+# Push + loop
+# --------------------------------------------------------------------------- #
+def push_balances_once(use_cache_if_empty: bool = True) -> bool:
+    payload = _collect_balances()
+
+    # If empty and we have a cache, send cached so Bus has *something* after deploys
+    if use_cache_if_empty and not payload.get("by_venue") and not payload.get("flat"):
+        cached = _load_cache()
+        if cached:
+            payload = cached
+
+    # Always stamp canonical agent (prevents cached legacy agent ids)
     payload = _stamp_agent(payload)
 
-    body = _canonical_json_bytes(payload)
-    headers = _auth_headers(secret, body)
+    # Always emit a compact snapshot line so Edge logs show balances evolution.
+    if TELEM_DEBUG or TELEM_DEBUG_DUMP:
+        try:
+            summary = _summarize_snapshot(payload)
+            print(f"[telemetry] snapshot {summary}")
+            if TELEM_DEBUG_DUMP:
+                try:
+                    dumped = json.dumps(
+                        payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    )
+                    if len(dumped) > 2000:
+                        dumped = dumped[:2000] + "...(truncated)"
+                    print(f"[telemetry] payload={dumped}")
+                except Exception as e:
+                    print(f"[telemetry] payload-dump-error: {e}")
+        except Exception as e:
+            print(f"[telemetry] snapshot-error: {e}")
 
-    url = f"{base}{path}"
-    try:
-        r = requests.post(url, data=body, headers=headers, timeout=REQ_TIMEOUT)
-        return r.status_code, r.text
-    except Exception as e:
-        return 0, f"POST failed: {e}"
-
-
-# --------------------------------------------------------------------------- #
-# Public API
-# --------------------------------------------------------------------------- #
-def build_balances_payload(
-    balances_by_venue: Dict[str, Dict[str, float]],
-    source: str = "edge",
-    extra: Optional[dict] = None,
-) -> dict:
-    """
-    Build telemetry payload expected by Bus /api/telemetry/push_balances.
-    """
-    payload = {
-        "ts": int(time.time()),
-        "source": source,
-        "balances": _filter_balances(balances_by_venue or {}),
-    }
-    if extra and isinstance(extra, dict):
-        payload.update(extra)
-    return _stamp_agent(payload)
-
-
-def push_balances_once(
-    balances_by_venue: Optional[Dict[str, Dict[str, float]]] = None,
-    use_cache_if_empty: bool = True,
-    path: str = "/api/telemetry/push_balances",
-) -> bool:
-    """
-    Push balances to Bus once. If balances_by_venue is None/empty and use_cache_if_empty,
-    use cached last balances if present.
-    """
-    bals = balances_by_venue or {}
-
-    if (not bals) and use_cache_if_empty:
-        cached = _load_cache()
-        if cached and isinstance(cached.get("balances"), dict):
-            bals = cached.get("balances") or {}
-            _log("using cached balances (empty live input)")
-
-    payload = build_balances_payload(bals)
-
-    # Cache what we're about to send, best-effort.
-    try:
-        _save_cache({"ts": payload.get("ts"), "agent_id": payload.get("agent_id"), "balances": payload.get("balances")})
-    except Exception:
-        pass
-
-    _dump(payload)
-
-    code, text = _post_json(path, payload)
-    ok = (200 <= int(code or 0) < 300)
-    if ok:
-        _log(f"push ok ({code})")
-    else:
-        _log(f"push failed ({code}): {text[:300] if isinstance(text,str) else text}")
+    ok = False
+    for attempt in (1, 2, 3):
+        try:
+            code, text = _post_json("/api/telemetry/push_balances", payload)
+            ok = 200 <= code < 300
+            if ok:
+                _save_cache(payload)
+                if TELEM_DEBUG:
+                    print(f"[telemetry] push_balances ok (attempt {attempt})")
+                break
+            else:
+                print(f"[telemetry] push_balances failed {code}: {text}")
+        except Exception as e:
+            print(f"[telemetry] error: {e}")
+        time.sleep(2**attempt)  # 2s, 4s backoff
     return ok
 
 
-# --------------------------------------------------------------------------- #
-# Background loop
-# --------------------------------------------------------------------------- #
-_STOP = threading.Event()
-_THREAD: Optional[threading.Thread] = None
+def start_balance_pusher():
+    def loop():
+        if HEARTBEAT_ON_BOOT:
+            push_balances_once(use_cache_if_empty=True)
+        while True:
+            start = time.time()
+            push_balances_once(use_cache_if_empty=False)
+            slp = max(5, PUSH_IVL - int(time.time() - start))
+            time.sleep(slp)
 
-
-def start_balance_pusher(
-    get_balances_fn,
-    every_s: int = 600,
-    push_on_boot: bool = True,
-    path: str = "/api/telemetry/push_balances",
-) -> None:
-    """
-    Start a background thread that periodically pushes balances to the Bus.
-
-    get_balances_fn: callable -> Dict[str, Dict[str, float]]
-    """
-    global _THREAD
-    if _THREAD and _THREAD.is_alive():
-        return
-
-    every_s = max(60, int(every_s or 600))
-    push_on_boot = bool(push_on_boot)
-
-    def _loop():
-        if push_on_boot:
-            try:
-                bals = get_balances_fn() or {}
-                push_balances_once(bals, use_cache_if_empty=True, path=path)
-            except Exception as e:
-                _log(f"boot push error: {e}")
-
-        while not _STOP.is_set():
-            try:
-                bals = get_balances_fn() or {}
-                push_balances_once(bals, use_cache_if_empty=True, path=path)
-            except Exception as e:
-                _log(f"push loop error: {e}")
-            # sleep in small chunks so stop() is responsive
-            for _ in range(every_s):
-                if _STOP.is_set():
-                    break
-                time.sleep(1)
-
-    _THREAD = threading.Thread(target=_loop, name="balance_pusher", daemon=True)
-    _THREAD.start()
-    _log(f"balance pusher started every_s={every_s} push_on_boot={push_on_boot}")
-
-
-def stop_balance_pusher() -> None:
-    _STOP.set()
-    t = _THREAD
-    if t and t.is_alive():
-        try:
-            t.join(timeout=5)
-        except Exception:
-            pass
+    t = threading.Thread(target=loop, name="balance-pusher", daemon=True)
+    t.start()
+    return t
 
 
 # --------------------------------------------------------------------------- #
-# CLI
+# CLI / module entrypoint
 # --------------------------------------------------------------------------- #
 def main() -> int:
-    """
-    One-shot push (useful for smoke tests):
-      python telemetry_sender.py
-    """
     ok = push_balances_once(use_cache_if_empty=True)
     # Keep this short and grep-friendly
     print(f"[telemetry] one-shot push ok={ok} agent={_resolve_agent_id()}")
@@ -365,3 +467,23 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def _post_json(path: str, payload: dict):
+    """
+    POST signed JSON to Bus, using deterministic serialization so HMAC matches.
+    """
+    base = (os.getenv("CLOUD_BASE_URL") or os.getenv("BUS_BASE_URL") or os.getenv("BASE_URL") or "").rstrip("/")
+    if not base:
+        raise RuntimeError("CLOUD_BASE_URL/BUS_BASE_URL/BASE_URL not set")
+    url = base + path
+
+    secret = TELEM_SECRET
+    if not secret:
+        raise RuntimeError("No telemetry signing secret set (OUTBOX_SECRET/EDGE_SECRET/TELEMETRY_SECRET).")
+
+    body = _canonical_json_bytes(payload)
+    headers = _auth_headers(secret, body)
+
+    resp = requests.post(url, data=body, headers=headers, timeout=REQ_TIMEOUT)
+    return resp.status_code, resp.text
