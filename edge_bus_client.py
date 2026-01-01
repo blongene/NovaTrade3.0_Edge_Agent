@@ -301,10 +301,15 @@ def pull(agent_id: str, limit: int = 5, log_every_s: int = 60) -> List[dict]:
     global _last_pull_log_ts
 
     body = {
+        # Send ALL common agent keys for compatibility with older/newer Bus builds
         "agent_id": str(agent_id).strip(),
+        "agent": str(agent_id).strip(),
+        "agent_target": str(agent_id).strip(),
+        "agentId": str(agent_id).strip(),
+    
         "limit": int(limit),
-        "max_items": int(limit),  # tolerate bus implementations expecting max_items
-        "n": int(limit),          # tolerate alternate key
+        "max_items": int(limit),
+        "n": int(limit),
         "ts": int(time.time()),
     }
 
