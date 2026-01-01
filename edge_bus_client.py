@@ -1,140 +1,247 @@
-#!/usr/bin/env python3
-"""
-edge_bus_client.py
-Client for Edge <-> Bus command leasing endpoints.
-
-Bus expects for /api/commands/pull and /api/commands/ack:
-  HMAC(secret=OUTBOX_SECRET, body=canonical_json) in header X-OUTBOX-SIGN
-
-This fixes Phase 25C 401 Unauthorized by signing correctly.
-"""
+# edge_bus_client.py — Signed client for Bus command endpoints (Phase 25C auth-tolerant)
+#
+# Fixes:
+# - Tolerates multiple base URL env var names (BASE_URL, BUS_BASE_URL, CLOUD_BASE_URL, PUBLIC_BASE_URL)
+# - Tolerates multiple HMAC secrets (OUTBOX_SECRET, EDGE_SECRET, TELEMETRY_SECRET) — OUTBOX_SECRET first
+# - Tolerates multiple signature header names used by Bus: X-OUTBOX-SIGN, X-Nova-Signature, X-NT-Sig
+# - On 401, automatically retries with alternate header/secret combos
+#
+# Endpoints used:
+#   POST /api/commands/pull
+#   POST /api/commands/ack
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-import json
 import os
+import json
+import hmac
+import hashlib
 import time
-from typing import Any, Dict, Optional
+import random
+from typing import Dict, Any, List, Tuple, Optional
 
 import requests
 
-
-DEFAULT_PULL_PATH = "/api/commands/pull"
-DEFAULT_ACK_PATH  = "/api/commands/ack"
-
-DEFAULT_SIGN_HEADER = "X-OUTBOX-SIGN"
-DEFAULT_SECRET_ENV  = "OUTBOX_SECRET"
+_last_pull_log_ts = 0.0  # rate-limit noisy transient errors
 
 
-def _canonical_json(obj: Any) -> str:
-    # Stable JSON for HMAC: sort keys + compact separators
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+# --------------------------------------------------------------------
+# Config helpers
+# --------------------------------------------------------------------
+
+def _pick_env(*keys: str) -> str:
+    for k in keys:
+        v = (os.getenv(k) or "").strip()
+        if v:
+            return v
+    return ""
 
 
-def _get_bus_base_url() -> str:
-    base = (
-        os.getenv("BUS_BASE_URL")
-        or os.getenv("CLOUD_BASE_URL")
-        or os.getenv("PUBLIC_BASE_URL")
-        or os.getenv("BASE_URL")
-        or ""
-    ).strip()
+def _base_url() -> str:
+    base = _pick_env("BASE_URL", "BUS_BASE_URL", "CLOUD_BASE_URL", "PUBLIC_BASE_URL")
     if not base:
         raise RuntimeError(
-            "Bus base URL is not set. Set BUS_BASE_URL or CLOUD_BASE_URL "
-            "(e.g. https://novatrade3-0.onrender.com)."
+            "Bus base URL missing. Set BASE_URL (or BUS_BASE_URL/CLOUD_BASE_URL/PUBLIC_BASE_URL)."
         )
+    if not (base.startswith("http://") or base.startswith("https://")):
+        raise RuntimeError(f"Bus base URL invalid (must start with http/https). Got: {base!r}")
     return base.rstrip("/")
 
 
-def _get_outbox_secret() -> str:
-    # Commands pull/ack should be OUTBOX_SECRET. If missing, fail loudly.
-    secret = (os.getenv(DEFAULT_SECRET_ENV) or "").strip()
-    if not secret:
-        raise RuntimeError(
-            "OUTBOX_SECRET is not set on Edge. "
-            "Phase 25C command leasing requires OUTBOX_SECRET to sign /api/commands/*."
-        )
-    return secret
+BASE_URL = _base_url()
+
+# Timeouts/backoff
+TIMEOUT = float(os.environ.get("EDGE_HTTP_TIMEOUT_SECS", "12"))   # seconds (connect/read)
+RETRIES = int(os.environ.get("EDGE_HTTP_RETRIES", "4"))           # total attempts (for retryable errors)
+BACKOFF0 = float(os.environ.get("EDGE_HTTP_BACKOFF_SECS", "0.6")) # base backoff
 
 
-def _sign(secret: str, body_text: str) -> str:
-    return hmac.new(secret.encode("utf-8"), body_text.encode("utf-8"), hashlib.sha256).hexdigest()
+# --------------------------------------------------------------------
+# Signing
+# --------------------------------------------------------------------
+
+def _canonical_json(d: dict) -> str:
+    # Match Bus-side HMAC expectations: stable keys, compact separators
+    return json.dumps(d, separators=(",", ":"), sort_keys=True)
 
 
-def post_signed(
-    path: str,
-    payload: Dict[str, Any],
-    *,
-    timeout: int = 15,
-    session: Optional[requests.Session] = None,
-) -> requests.Response:
+def _sign_raw(secret: str, raw: str) -> str:
+    return hmac.new(secret.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _secret_candidates() -> List[str]:
+    # Phase25C reality:
+    # - /api/commands/* often uses OUTBOX_SECRET (cloud) but edge may store it as EDGE_SECRET
+    # - Some setups reused TELEMETRY_SECRET (not preferred, but tolerating helps recovery)
+    seen = set()
+    out: List[str] = []
+    for k in ("OUTBOX_SECRET", "EDGE_SECRET", "TELEMETRY_SECRET"):
+        v = (os.getenv(k) or "").strip()
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _header_candidates() -> List[str]:
+    # You’ve observed Bus verifying several headers across endpoints:
+    # - X-OUTBOX-SIGN
+    # - X-Nova-Signature
+    # - X-NT-Sig
+    return ["X-OUTBOX-SIGN", "X-Nova-Signature", "X-NT-Sig"]
+
+
+def _retryable_status(code: int) -> bool:
+    return code == 429 or (500 <= code < 600)
+
+
+def _short_text(text: str, limit: int = 180) -> str:
+    t = (text or "").strip()
+    if t.startswith("<!DOCTYPE") or t.startswith("<html"):
+        return "HTML error page (e.g., 502)"
+    return (t[:limit] + "…") if len(t) > limit else t
+
+
+# --------------------------------------------------------------------
+# Core signed POST with retries + auth fallback
+# --------------------------------------------------------------------
+
+def post_signed(path: str, body: dict, timeout: Optional[float | Tuple[float, float]] = None) -> requests.Response:
     """
-    POST JSON with OUTBOX HMAC signature header.
+    Signed POST with:
+      - automatic retries on 5xx/429 and connection issues
+      - automatic auth fallback on 401 (tries alternate header/secret combos)
     """
-    base = _get_bus_base_url()
-    url = base + path
+    url = f"{BASE_URL}{path}"
+    raw = _canonical_json(body)
 
-    # include a timestamp to discourage replay + make debugging easier
-    if "ts" not in payload:
-        payload["ts"] = int(time.time())
+    secrets = _secret_candidates()
+    if not secrets:
+        raise RuntimeError("No signing secret found. Set OUTBOX_SECRET or EDGE_SECRET on Edge.")
 
-    body_text = _canonical_json(payload)
-    secret = _get_outbox_secret()
-    sig = _sign(secret, body_text)
+    header_names = _header_candidates()
 
-    headers = {
-        "Content-Type": "application/json",
-        DEFAULT_SIGN_HEADER: sig,
-    }
+    if timeout is None:
+        timeout = (TIMEOUT, TIMEOUT)
 
-    s = session or requests.Session()
-    resp = s.post(url, data=body_text.encode("utf-8"), headers=headers, timeout=timeout)
+    # Build auth combos: try OUTBOX_SECRET first, then EDGE_SECRET, etc; for each, try headers in order.
+    combos: List[Tuple[str, str]] = []
+    for sec in secrets:
+        for hdr in header_names:
+            combos.append((sec, hdr))
 
-    # Helpful hint (no secrets) on auth failures
-    if resp.status_code in (401, 403):
+    last_exc: Optional[Exception] = None
+
+    # First, try auth combos (fast) — only re-loop on 401.
+    for sec, hdr in combos:
+        sig = _sign_raw(sec, raw)
+        headers = {"Content-Type": "application/json", hdr: sig}
+
         try:
-            j = resp.json()
-        except Exception:
-            j = {"raw": resp.text[:200]}
-        print(
-            f"[edge_bus_client] AUTH FAIL {resp.status_code} on {path} "
-            f"(expects {DEFAULT_SECRET_ENV}+{DEFAULT_SIGN_HEADER}). "
-            f"resp={j}"
-        )
+            r = requests.post(url, data=raw, headers=headers, timeout=timeout)
 
-    return resp
+            # If auth fails, try next combo immediately.
+            if r.status_code == 401:
+                last_exc = requests.HTTPError(f"401 {_short_text(r.text)}", response=r)
+                continue
+
+            # For retryable server/rate errors, fall through to retry loop below.
+            if _retryable_status(r.status_code):
+                last_exc = requests.HTTPError(f"{r.status_code} {_short_text(r.text)}", response=r)
+                break
+
+            r.raise_for_status()
+            return r
+
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_exc = e
+            break
+
+        except requests.HTTPError as e:
+            resp = getattr(e, "response", None)
+            code = getattr(resp, "status_code", None)
+            if code == 401:
+                last_exc = e
+                continue
+            if code is None or not _retryable_status(code):
+                raise
+            last_exc = e
+            break
+
+    # If we got here, either we exhausted 401 combos OR hit retryable/network.
+    # Now do a bounded retry loop (re-using the *first* auth combo) for transient issues.
+    sec0, hdr0 = combos[0]
+    sig0 = _sign_raw(sec0, raw)
+    headers0 = {"Content-Type": "application/json", hdr0: sig0}
+
+    for attempt in range(1, RETRIES + 1):
+        try:
+            r = requests.post(url, data=raw, headers=headers0, timeout=timeout)
+
+            if r.status_code == 401:
+                # If we’re *still* 401 here, surface it clearly (don’t waste time retrying).
+                r.raise_for_status()
+
+            if _retryable_status(r.status_code):
+                last_exc = requests.HTTPError(f"{r.status_code} {_short_text(r.text)}", response=r)
+            else:
+                r.raise_for_status()
+                return r
+
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_exc = e
+
+        except requests.HTTPError as e:
+            resp = getattr(e, "response", None)
+            code = getattr(resp, "status_code", None)
+            if code is None or not _retryable_status(code):
+                raise
+            last_exc = e
+
+        sleep_s = BACKOFF0 * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+        time.sleep(min(sleep_s, 6.0))
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("post_signed failed without exception")
 
 
-def pull(agent_id: str, limit: int = 1) -> Dict[str, Any]:
-    """
-    Pull/lease commands for this agent.
-    Returns dict parsed from JSON.
-    """
-    payload = {"agent_id": str(agent_id).strip(), "limit": int(limit)}
-    r = post_signed(DEFAULT_PULL_PATH, payload)
+# --------------------------------------------------------------------
+# Convenience
+# --------------------------------------------------------------------
+
+def pull(agent_id: str, limit: int = 1) -> dict:
+    global _last_pull_log_ts
+
+    body = {"agent_id": str(agent_id), "limit": int(limit), "ts": int(time.time())}
+
     try:
+        r = post_signed("/api/commands/pull", body)
         return r.json()
-    except Exception:
-        return {"ok": False, "status": r.status_code, "text": r.text[:500]}
+    except Exception as e:
+        msg = getattr(e, "args", [str(e)])[0]
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        now = time.time()
+
+        transient = (code in (502, 503, 504, 429)) or ("HTML error page" in str(msg)) or ("<!DOCTYPE" in str(msg))
+        if transient:
+            if now - _last_pull_log_ts > 60:
+                print(f"[edge] WARN pull transient {code or ''}: {msg}")
+                _last_pull_log_ts = now
+        else:
+            print(f"[edge] ERROR pull error: {msg}")
+
+        return {"ok": False, "commands": [], "error": msg}
 
 
-def ack(agent_id: str, cmd_id: str, ok: bool, receipt: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Ack a leased command back to Bus.
-    """
-    payload: Dict[str, Any] = {
-        "agent_id": str(agent_id).strip(),
-        "cmd_id": str(cmd_id),
+def ack(agent_id: str, cmd_id: int | str, ok: bool, receipt: dict) -> dict:
+    body = {
+        "agent_id": str(agent_id),
+        "cmd_id": cmd_id,
         "ok": bool(ok),
+        "receipt": receipt or {},
+        "ts": int(time.time()),
     }
-    if receipt is not None:
-        payload["receipt"] = receipt
-
-    r = post_signed(DEFAULT_ACK_PATH, payload)
-    try:
-        return r.json()
-    except Exception:
-        return {"ok": False, "status": r.status_code, "text": r.text[:500]}
+    r = post_signed("/api/commands/ack", body)
+    r.raise_for_status()
+    return r.json()
