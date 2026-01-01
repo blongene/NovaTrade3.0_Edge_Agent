@@ -31,7 +31,7 @@ import time
 import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
-
+import hmac, hashlib, base64
 import requests
 
 
@@ -328,7 +328,16 @@ def _build_snapshot(agent: str, by_venue: Dict[str, Dict[str, float]], flat: Dic
 
 def _post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> Tuple[bool, str]:
     try:
-        r = requests.post(url, json=payload, headers=headers or {}, timeout=DEFAULT_TIMEOUT_S)
+        sig = _sign_payload(payload)
+
+        hdrs = {
+            "Content-Type": "application/json",
+            "X-OUTBOX-SIGN": sig,
+        }
+        if headers:
+            hdrs.update(headers)
+        
+        r = requests.post(url, json=payload, headers=hdrs, timeout=DEFAULT_TIMEOUT_S)
         if r.status_code >= 200 and r.status_code < 300:
             return True, r.text[:200]
         return False, f"{r.status_code} {r.text[:200]}"
@@ -409,7 +418,15 @@ def start_balance_pusher(
     t.start()
     return t
 
+def _sign_payload(payload: dict) -> str:
+    secret = os.getenv("OUTBOX_SECRET") or os.getenv("EDGE_SECRET")
+    if not secret:
+        raise RuntimeError("No OUTBOX_SECRET or EDGE_SECRET set for telemetry signing")
 
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    sig = hmac.new(secret.encode(), raw, hashlib.sha256).digest()
+    return base64.b64encode(sig).decode()
+    
 def main() -> None:
     ok = push_balances_once()
     _safe_print("[telemetry]", f"one-shot push ok={ok} agent={_resolve_agent_id()}")
