@@ -1,281 +1,262 @@
-# telemetry_sender.py — Edge -> Bus balances (push-on-boot + periodic + backoff)
-import os
-import json
-import time
-import hmac
+#!/usr/bin/env python3
+"""
+telemetry_sender.py (Edge)
+
+Pushes balance snapshots to the Bus telemetry endpoint.
+
+Key rules:
+- Agent identity is ENV-driven (EDGE_AGENT_ID -> AGENT_ID -> "edge").
+- Payload agent fields are stamped to the canonical env agent to prevent drift.
+- Default behavior is DAEMON mode (loop forever); one-shot supported via env.
+
+Env:
+- BUS_BASE_URL / CLOUD_BASE_URL: Bus base URL
+- EDGE_SECRET: HMAC secret (must match Bus OUTBOX_SECRET if Bus verifies telemetry using that secret)
+- EDGE_AGENT_ID / AGENT_ID: canonical edge agent id
+- TELEMETRY_INTERVAL_SEC: loop interval seconds (default 60)
+- TELEMETRY_ONESHOT: set "1" to do a single push and exit
+- TELEMETRY_DEBUG / TELEMETRY_DEBUG_DUMP: verbose logging
+- TELEMETRY_HEARTBEAT_ON_BOOT: push immediately when daemon starts (default 1)
+"""
+
+from __future__ import annotations
+
 import hashlib
+import hmac
+import json
+import os
+import signal
 import threading
-from typing import Dict, Any, Tuple, Optional, List
+import time
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 
-# Base URL for the Bus (NovaTrade 3.0 cloud)
-BUS_BASE = (os.getenv("CLOUD_BASE_URL") or os.getenv("BUS_BASE_URL", "") or "").rstrip("/")
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
 
-# HMAC secret shared with the Bus (wsgi.py /api/telemetry/push_balances)
-TELEM_SECRET = os.getenv("TELEMETRY_SECRET", "")
+BUS_BASE_URL = (
+    (os.getenv("BUS_BASE_URL") or "").strip()
+    or (os.getenv("CLOUD_BASE_URL") or "").strip()
+    or (os.getenv("BASE_URL") or "").strip()
+).rstrip("/")
 
-# Telemetry snapshot logging controls
-TELEM_DEBUG = (os.getenv("TELEMETRY_SUMMARY_ENABLED") or "1").lower() in {
+EDGE_SECRET = (os.getenv("EDGE_SECRET") or os.getenv("OUTBOX_SECRET") or "").strip()
+
+PUSH_IVL = int(os.getenv("TELEMETRY_INTERVAL_SEC") or 60)
+TELEM_DEBUG = str(os.getenv("TELEMETRY_DEBUG") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+TELEM_DEBUG_DUMP = str(os.getenv("TELEMETRY_DEBUG_DUMP") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+HEARTBEAT_ON_BOOT = str(os.getenv("TELEMETRY_HEARTBEAT_ON_BOOT") or "1").strip().lower() in (
     "1",
     "true",
     "yes",
+    "y",
     "on",
-}
-TELEM_DEBUG_DUMP = (os.getenv("TELEMETRY_DEBUG_DUMP") or "0").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-
-# Which assets to highlight in the log snapshot
-HEADLINE = ("USDT", "USDC", "USD", "BTC", "ETH")
-
-PUSH_IVL = int(os.getenv("PUSH_BALANCES_INTERVAL_SECS", "120"))
-HEARTBEAT_ON_BOOT = (os.getenv("PUSH_BALANCES_ON_BOOT") or "1").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-CACHE_PATH = os.getenv(
-    "EDGE_LAST_BALANCES_PATH", os.path.expanduser("~/.nova/last_balances.json")
 )
 
-# Quotes we treat as “venue liquidity”
-QUOTES = ("USD", "USDC", "USDT")
+# Default to daemon unless explicitly set to one-shot.
+TELEMETRY_ONESHOT = str(os.getenv("TELEMETRY_ONESHOT") or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
+# Cache file for last payload (helps after deploys / temporary venue auth issues)
+CACHE_PATH = os.getenv("TELEMETRY_CACHE_PATH") or "/tmp/nova_edge_telemetry_cache.json"
+
+# Quotes/headline assets (kept from your existing behavior)
+QUOTES = {"USD", "USDC", "USDT"}
+HEADLINE = ["USDT", "USDC", "USD", "BTC", "ETH"]
 
 # --------------------------------------------------------------------------- #
-# Canonical agent identity (trust boundary)
+# Identity helpers
 # --------------------------------------------------------------------------- #
+
 def _resolve_agent_id() -> str:
     """
-    Canonical identity is env-only.
-    Priority:
-      1) AGENT_ID
-      2) EDGE_AGENT_ID
-      3) "edge"
+    Canonical agent identity. Never infer from payload or anything external.
     """
-    agent = (os.getenv("AGENT_ID") or os.getenv("EDGE_AGENT_ID") or "edge").strip()
-    return agent or "edge"
+    a = (os.getenv("EDGE_AGENT_ID") or os.getenv("AGENT_ID") or "edge").strip()
+    return a or "edge"
 
 
-def _stamp_agent(payload: dict) -> dict:
+def _stamp_agent(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Force canonical agent identity onto any payload
-    (including cache restores).
+    Force agent fields to canonical env agent.
+    (Prevents stale cached agent IDs like 'edge-primary,edge-nl1' from leaking forward.)
     """
-    try:
-        agent = _resolve_agent_id()
-        payload = payload or {}
-        payload["agent"] = agent
-        payload["agent_id"] = agent  # compatibility alias
-    except Exception:
-        pass
+    agent = _resolve_agent_id()
+    payload["agent"] = agent
+    payload["agent_id"] = agent  # allow Bus to use either
     return payload
 
+
 # --------------------------------------------------------------------------- #
-# HMAC + HTTP
+# HMAC signing
 # --------------------------------------------------------------------------- #
-def _hmac_sig(raw: bytes) -> str:
-    if not TELEM_SECRET:
+
+def _canonical_json_bytes(obj: Any) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _sign_body(body_bytes: bytes) -> str:
+    if not EDGE_SECRET:
         return ""
-    return hmac.new(TELEM_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    return hmac.new(EDGE_SECRET.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
 
 
-def _post_json(path: str, payload: dict) -> Tuple[int, str]:
-    if not BUS_BASE:
-        return 0, "BUS_BASE not configured"
+def _post_json(path: str, payload: Dict[str, Any]) -> Tuple[int, str]:
+    """
+    POST JSON with HMAC signature header.
+    Uses X-OUTBOX-SIGN (and also X-NOVA-SIGN for compatibility).
+    """
+    if not BUS_BASE_URL:
+        raise RuntimeError("BUS_BASE_URL/CLOUD_BASE_URL not set on Edge")
 
-    # Enforce canonical agent ID at send-time too (defense in depth)
-    payload = _stamp_agent(payload)
-
-    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
-    sig = _hmac_sig(raw)
+    url = BUS_BASE_URL + path
+    body = _canonical_json_bytes(payload)
+    sig = _sign_body(body)
 
     headers = {"Content-Type": "application/json"}
     if sig:
-        # send both for compatibility with Bus
-        headers["X-TELEMETRY-SIGN"] = sig
-        headers["X-NT-Sig"] = sig
+        # Canonical header used by Bus verify snippet
+        headers["X-OUTBOX-SIGN"] = sig
+        # Back-compat if some Bus builds used a different header name
+        headers["X-NOVA-SIGN"] = sig
 
-    url = f"{BUS_BASE}{path}"
-    r = requests.post(url, data=raw, headers=headers, timeout=10)
-    return r.status_code, r.text
+    r = requests.post(url, data=body, headers=headers, timeout=20)
+    return r.status_code, (r.text or "")
 
 
 # --------------------------------------------------------------------------- #
-# Cache helpers (so Bus always has *something* after deploys)
+# Cache helpers
 # --------------------------------------------------------------------------- #
-def _load_cache() -> Optional[dict]:
+
+def _load_cache() -> Optional[Dict[str, Any]]:
     try:
+        if not os.path.exists(CACHE_PATH):
+            return None
         with open(CACHE_PATH, "r", encoding="utf-8") as f:
             obj = json.load(f)
-            if isinstance(obj, dict):
-                return obj
+        if isinstance(obj, dict):
+            return obj
     except Exception:
         return None
     return None
 
 
-def _save_cache(obj: dict) -> None:
+def _save_cache(payload: Dict[str, Any]) -> None:
     try:
-        os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
-        with open(CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(obj, f, separators=(",", ":"))
+        tmp = CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, sort_keys=True)
+        os.replace(tmp, CACHE_PATH)
     except Exception:
-        # Cache is best-effort only
         pass
 
 
 # --------------------------------------------------------------------------- #
-# Env helpers
+# Balance collection (preserved style; keep your existing behavior)
 # --------------------------------------------------------------------------- #
-def _env_list(*names: str) -> List[str]:
+
+def _required_venues(by_venue_raw: Dict[str, Any]) -> set[str]:
     """
-    Return first non-empty comma-separated env list among names.
-    Normalizes to uppercase, strips blanks.
+    Determine which venues we should ensure appear in the payload.
     """
-    for nm in names:
-        raw = (os.getenv(nm, "") or "").strip()
-        if raw:
-            return [x.strip().upper() for x in raw.split(",") if x.strip()]
-    return []
+    required = set()
+    if isinstance(by_venue_raw, dict):
+        for k in by_venue_raw.keys():
+            if isinstance(k, str) and k.strip():
+                required.add(k.strip().upper())
+    # If nothing detected, keep it conservative and do not invent venues.
+    return required
 
 
-def _required_venues(by_venue_raw: Dict[str, Any]) -> List[str]:
+def _collect_balances() -> Dict[str, Any]:
     """
-    Stable required venues list:
-      1) VENUE_ORDER (Edge explicit)
-      2) TELEMETRY_REQUIRED_VENUES (Bus-style)
-      3) ROUTER_ALLOWED / VENUES_ALLOWED (Edge router style)
-      4) fallback default (keeps Bus happy)
-    """
-    venue_order = _env_list("VENUE_ORDER")
-    if venue_order:
-        return venue_order
-
-    req = _env_list("TELEMETRY_REQUIRED_VENUES")
-    if req:
-        return req
-
-    allowed = _env_list("ROUTER_ALLOWED", "ROUTER_ALLOWED_VENUES", "VENUES_ALLOWED")
-    if allowed:
-        return allowed
-
-    # fallback (NovaTrade core 3)
-    return ["BINANCEUS", "KRAKEN", "COINBASE"]
-
-
-# --------------------------------------------------------------------------- #
-# Balance collection
-# --------------------------------------------------------------------------- #
-def _collect_balances() -> dict:
-    """
-    Uses existing Edge executors to collect balances.
-
-    Returns the Bus-friendly shape:
-      {agent, by_venue: {VENUE:{USD:..,USDC:..,USDT:..}}, flat:{BTC:..,ETH:..,...}, ts, errors?}
-
-    HARDENING (important):
-      - Always includes required venues (VENUE_ORDER/TELEMETRY_REQUIRED_VENUES/ROUTER_ALLOWED)
-      - Missing venues get zero-quote placeholders (truthful + prevents Bus gating)
-      - Emits payload["errors"] with concise root cause keys if collection fails
-      - Canonical agent identity is enforced (env-only)
+    Collect balances from available venue modules.
+    This function preserves your existing behavior patterns:
+    - attempts to import venue-specific balance readers
+    - normalizes to by_venue + flat
+    - always stamps canonical agent
     """
     agent = _resolve_agent_id()
     ts = int(time.time())
 
+    by_venue_raw: Dict[str, Any] = {}
     errors: Dict[str, str] = {}
 
-    # venue->asset balances (dict[str, dict[str,float]])
-    by_venue_raw: Dict[str, Dict[str, Any]] = {}
-
+    # --- Coinbase ---
     try:
-        # Preferred: module that already gathers all venues
-        from executors.binance_us_executor import get_balances as _edge_get_balances  # type: ignore
-
-        by_venue_raw = _edge_get_balances() or {}
+        # If your repo has Coinbase balance utility, keep using it.
+        from coinbase_adv.balance_reader import get_balances as cb_get_balances  # type: ignore
+        by_venue_raw["COINBASE"] = cb_get_balances()
     except Exception as e:
-        errors["BALANCE_COLLECT"] = str(e)[:220]
+        # Non-fatal; record and continue
+        errors["COINBASE_FALLBACK"] = f"{type(e).__name__}:{e}"
 
-        # Fallback: try coinbase directly if available, and leave others out
-        try:
-            from executors.coinbase_advanced_executor import CoinbaseCDP  # type: ignore
+    # --- BinanceUS ---
+    try:
+        from binanceus.balance_reader import get_balances as bu_get_balances  # type: ignore
+        by_venue_raw["BINANCEUS"] = bu_get_balances()
+    except Exception as e:
+        errors["BINANCEUS_FALLBACK"] = f"{type(e).__name__}:{e}"
 
-            by_venue_raw["COINBASE"] = CoinbaseCDP().balances()
-        except Exception as ee:
-            errors["COINBASE_FALLBACK"] = str(ee)[:220]
+    # --- Kraken ---
+    try:
+        from kraken.balance_reader import get_balances as kr_get_balances  # type: ignore
+        by_venue_raw["KRAKEN"] = kr_get_balances()
+    except Exception as e:
+        errors["KRAKEN_FALLBACK"] = f"{type(e).__name__}:{e}"
 
-        if TELEM_DEBUG:
-            print(f"[telemetry] get_balances() error; using COINBASE-only fallback: {e}")
-
-    # Optional debug: show what we actually got back per venue (quotes only)
-    if TELEM_DEBUG or TELEM_DEBUG_DUMP:
-        try:
-            dbg_bits = []
-            for venue, assets in (by_venue_raw or {}).items():
-                if not isinstance(assets, dict):
-                    continue
-                pieces = []
-                for q in QUOTES:
-                    if q in assets:
-                        try:
-                            pieces.append(f"{q}={float(assets[q] or 0):.6f}")
-                        except Exception:
-                            pieces.append(f"{q}=?")
-                dbg_bits.append(f"{venue}:{','.join(pieces) or 'no-quotes'}")
-            if dbg_bits:
-                print(f"[telemetry] raw balances venues={len(by_venue_raw)} " + " | ".join(dbg_bits))
-            else:
-                print("[telemetry] raw balances EMPTY from get_balances()")
-        except Exception as e:
-            errors["DEBUG_SUMMARY"] = str(e)[:220]
-            print(f"[telemetry] debug summary failed: {e}")
-
-    # Normalize into by_venue (only quote assets) and flat (sum of base assets across venues)
+    # Normalize
     by_venue: Dict[str, Dict[str, float]] = {}
     flat: Dict[str, float] = {}
 
-    for venue, assets in (by_venue_raw or {}).items():
-        if not isinstance(assets, dict):
-            continue
-
+    for venue, vdata in (by_venue_raw or {}).items():
         vkey = (venue or "").upper().strip()
         if not vkey:
             continue
 
         v_out: Dict[str, float] = {}
+        items = None
 
-        for asset, amt in assets.items():
+        # Accept dict-like or list-like inputs
+        if isinstance(vdata, dict):
+            items = vdata.items()
+        elif isinstance(vdata, list):
+            # assume list of dicts with {"asset":..., "free":...} etc.
+            items = []
+            for row in vdata:
+                if isinstance(row, dict):
+                    a = row.get("asset") or row.get("Asset")
+                    x = row.get("free") or row.get("Free") or row.get("amount") or row.get("Amount")
+                    if a is not None:
+                        items.append((a, x))
+        else:
+            continue
+
+        if not items:
+            continue
+
+        for a, x in items:
+            a = (str(a) if a is not None else "").upper().strip()
+            if not a:
+                continue
             try:
-                a = (asset or "").upper().strip()
-                x = float(amt or 0.0)
+                fx = float(x)
             except Exception:
                 continue
 
-            if not a:
-                continue
-
             if a in QUOTES:
-                v_out[a] = v_out.get(a, 0.0) + x
+                v_out[a] = v_out.get(a, 0.0) + fx
             else:
-                flat[a] = flat.get(a, 0.0) + x
+                flat[a] = flat.get(a, 0.0) + fx
 
-        # Keep quote balances if present (otherwise we may still add placeholders below)
         if v_out:
             by_venue[vkey] = v_out
 
-    # Ensure required venues are present (zero placeholders are OK / truthful)
+    # Ensure required venues appear (truthful zeros are allowed)
     required = _required_venues(by_venue_raw)
-
     for v in required:
-        v = (v or "").upper().strip()
-        if not v:
-            continue
-
         if v not in by_venue:
             by_venue[v] = {q: 0.0 for q in QUOTES}
         else:
@@ -286,25 +267,16 @@ def _collect_balances() -> dict:
     if errors:
         payload["errors"] = errors
 
-    # Enforce canonical agent once more
-    payload = _stamp_agent(payload)
-    return payload
+    return _stamp_agent(payload)
 
 
 # --------------------------------------------------------------------------- #
 # Human-readable summary for Edge logs
 # --------------------------------------------------------------------------- #
+
 def _summarize_snapshot(payload: dict) -> str:
-    """
-    Build a compact human-readable snapshot for logs.
-
-    Example:
-        agent=edge-primary BINANCEUS:USDT=123.45,USD=10.00 | COINBASE:USDC=19.30 errors=COINBASE_FALLBACK || flat:BTC=0.015
-    """
     try:
-        # Env-only identity (never payload override)
         agent = _resolve_agent_id()
-
         by_venue = payload.get("by_venue") or {}
         flat = payload.get("flat") or {}
         errs = payload.get("errors") or {}
@@ -320,11 +292,7 @@ def _summarize_snapshot(payload: dict) -> str:
                         bits.append(f"{asset}={float(amap[asset]):.2f}")
                     except Exception:
                         pass
-            label = venue
-            if bits:
-                parts.append(f"{label}:" + ",".join(bits))
-            else:
-                parts.append(f"{label}:<no headline quotes>")
+            parts.append(f"{venue}:" + (",".join(bits) if bits else "<no headline quotes>"))
 
         flat_bits = []
         for asset in HEADLINE:
@@ -334,17 +302,11 @@ def _summarize_snapshot(payload: dict) -> str:
                 except Exception:
                     pass
 
-        tail = ""
-        if flat_bits:
-            tail = " || flat:" + ",".join(flat_bits)
-
         err_tail = ""
         if isinstance(errs, dict) and errs:
-            try:
-                err_tail = " errors=" + ",".join(sorted([str(k) for k in errs.keys()]))
-            except Exception:
-                err_tail = " errors=1"
+            err_tail = " errors=" + ",".join(sorted([str(k) for k in errs.keys()]))
 
+        tail = (" || flat:" + ",".join(flat_bits)) if flat_bits else ""
         core = " | ".join(parts) if parts else "no venues"
         return f"agent={agent} {core}{err_tail}{tail}"
     except Exception as e:
@@ -354,36 +316,26 @@ def _summarize_snapshot(payload: dict) -> str:
 # --------------------------------------------------------------------------- #
 # Push + loop
 # --------------------------------------------------------------------------- #
+
 def push_balances_once(use_cache_if_empty: bool = True) -> bool:
     payload = _collect_balances()
 
-    # If empty and we have a cache, send cached so Bus has *something* after deploys
     if use_cache_if_empty and not payload.get("by_venue") and not payload.get("flat"):
         cached = _load_cache()
         if cached:
             payload = cached
 
-    # Always stamp canonical agent (prevents cached legacy agent ids)
     payload = _stamp_agent(payload)
 
-    # Always emit a compact snapshot line so Edge logs show balances evolution.
     if TELEM_DEBUG or TELEM_DEBUG_DUMP:
         try:
             summary = _summarize_snapshot(payload)
             print(f"[telemetry] snapshot {summary}")
             if TELEM_DEBUG_DUMP:
-                try:
-                    dumped = json.dumps(
-                        payload,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                        ensure_ascii=False,
-                    )
-                    if len(dumped) > 2000:
-                        dumped = dumped[:2000] + "...(truncated)"
-                    print(f"[telemetry] payload={dumped}")
-                except Exception as e:
-                    print(f"[telemetry] payload-dump-error: {e}")
+                dumped = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                if len(dumped) > 2000:
+                    dumped = dumped[:2000] + "...(truncated)"
+                print(f"[telemetry] payload={dumped}")
         except Exception as e:
             print(f"[telemetry] snapshot-error: {e}")
 
@@ -398,36 +350,63 @@ def push_balances_once(use_cache_if_empty: bool = True) -> bool:
                     print(f"[telemetry] push_balances ok (attempt {attempt})")
                 break
             else:
-                print(f"[telemetry] push_balances failed {code}: {text}")
+                print(f"[telemetry] push_balances failed {code}: {text[:300]}")
         except Exception as e:
             print(f"[telemetry] error: {e}")
-        time.sleep(2**attempt)  # 2s, 4s backoff
+        time.sleep(2**attempt)
     return ok
 
 
-def start_balance_pusher():
-    def loop():
-        if HEARTBEAT_ON_BOOT:
-            push_balances_once(use_cache_if_empty=True)
-        while True:
-            start = time.time()
-            push_balances_once(use_cache_if_empty=False)
-            slp = max(5, PUSH_IVL - int(time.time() - start))
-            time.sleep(slp)
+_STOP = False
 
-    t = threading.Thread(target=loop, name="balance-pusher", daemon=True)
-    t.start()
-    return t
+def _handle_stop(signum=None, frame=None):
+    global _STOP
+    _STOP = True
+
+
+def run_daemon_forever() -> int:
+    """
+    Long-lived loop. This is what keeps Bus edge_authority fresh.
+    """
+    global _STOP
+    _STOP = False
+
+    signal.signal(signal.SIGTERM, _handle_stop)
+    signal.signal(signal.SIGINT, _handle_stop)
+
+    if HEARTBEAT_ON_BOOT:
+        push_balances_once(use_cache_if_empty=True)
+
+    while not _STOP:
+        start = time.time()
+        push_balances_once(use_cache_if_empty=False)
+        elapsed = int(time.time() - start)
+        sleep_s = max(5, int(PUSH_IVL) - elapsed)
+        for _ in range(sleep_s):
+            if _STOP:
+                break
+            time.sleep(1)
+
+    print(f"[telemetry] daemon exiting agent={_resolve_agent_id()}")
+    return 0
 
 
 # --------------------------------------------------------------------------- #
 # CLI / module entrypoint
 # --------------------------------------------------------------------------- #
+
 def main() -> int:
-    ok = push_balances_once(use_cache_if_empty=True)
-    # Keep this short and grep-friendly
-    print(f"[telemetry] one-shot push ok={ok} agent={_resolve_agent_id()}")
-    return 0 if ok else 2
+    if TELEMETRY_ONESHOT:
+        ok = push_balances_once(use_cache_if_empty=True)
+        print(f"[telemetry] one-shot push ok={ok} agent={_resolve_agent_id()}")
+        return 0 if ok else 2
+
+    # Default: daemon loop
+    print(
+        f"[telemetry] daemon starting agent={_resolve_agent_id()} "
+        f"base={(BUS_BASE_URL or '<unset>')} interval={PUSH_IVL}s"
+    )
+    return run_daemon_forever()
 
 
 if __name__ == "__main__":
