@@ -1,3 +1,47 @@
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def _resolve_agent_id() -> str:
+    """
+    Canonical agent id to use for telemetry.
+    Priority: EDGE_AGENT_ID -> AGENT_ID -> AGENT -> "edge"
+    """
+    return (os.getenv("EDGE_AGENT_ID") or os.getenv("AGENT_ID") or os.getenv("AGENT") or "edge").strip() or "edge"
+
+
+def _canonical_json_bytes(obj: dict) -> bytes:
+    """
+    IMPORTANT: We sign the *exact bytes* we send to the Bus.
+
+    The Bus verifier typically HMACs the raw request body (request.get_data()).
+    If we let requests/json serialize independently, minor whitespace / key-order
+    differences can break signatures. We therefore:
+      - sort_keys=True
+      - compact separators
+      - UTF-8 encoding
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _hmac_sha256_hex(secret: str, body_bytes: bytes) -> str:
+    return hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+
+
+def _auth_headers(secret: str, body_bytes: bytes) -> dict:
+    """
+    Compatibility: Bus has historically used different header names.
+    We send the same signature under multiple headers, with X-OUTBOX-SIGN as primary.
+    """
+    sig = _hmac_sha256_hex(secret, body_bytes)
+    return {
+        "Content-Type": "application/json",
+        "X-OUTBOX-SIGN": sig,       # Phase 24/25 canonical
+        "X-TELEMETRY-SIGN": sig,    # legacy/older variants
+        "X-NOVA-SIGNATURE": sig,
+        "X-NOVA-SIGN": sig,
+    }
+
+
 # telemetry_sender.py — Edge -> Bus balances (push-on-boot + periodic + backoff)
 import os
 import json
@@ -50,17 +94,6 @@ QUOTES = ("USD", "USDC", "USDT")
 # --------------------------------------------------------------------------- #
 # Canonical agent identity (trust boundary)
 # --------------------------------------------------------------------------- #
-def _resolve_agent_id() -> str:
-    """
-    Canonical identity is env-only.
-    Priority:
-      1) AGENT_ID
-      2) EDGE_AGENT_ID
-      3) "edge"
-    """
-    agent = (os.getenv("AGENT_ID") or os.getenv("EDGE_AGENT_ID") or "edge").strip()
-    return agent or "edge"
-
 
 def _stamp_agent(payload: dict) -> dict:
     """
@@ -70,12 +103,11 @@ def _stamp_agent(payload: dict) -> dict:
     try:
         agent = _resolve_agent_id()
         payload = payload or {}
-        payload["agent"] = agent
-        payload["agent_id"] = agent  # compatibility alias
+        payload["agent"] = _resolve_agent_id()
+        payload["agent_id"] = _resolve_agent_id()
     except Exception:
         pass
     return payload
-
 
 # --------------------------------------------------------------------------- #
 # HMAC + HTTP
@@ -433,3 +465,23 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def _post_json(path: str, payload: dict):
+    """
+    POST signed JSON to Bus, using deterministic serialization so HMAC matches.
+    """
+    base = (os.getenv("CLOUD_BASE_URL") or os.getenv("BUS_BASE_URL") or os.getenv("BASE_URL") or "").rstrip("/")
+    if not base:
+        raise RuntimeError("CLOUD_BASE_URL/BUS_BASE_URL/BASE_URL not set")
+    url = base + path
+
+    secret = TELEM_SECRET
+    if not secret:
+        raise RuntimeError("No telemetry signing secret set (OUTBOX_SECRET/EDGE_SECRET/TELEMETRY_SECRET).")
+
+    body = _canonical_json_bytes(payload)
+    headers = _auth_headers(secret, body)
+
+    resp = requests.post(url, data=body, headers=headers, timeout=REQ_TIMEOUT)
+    return resp.status_code, resp.text
