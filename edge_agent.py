@@ -13,10 +13,6 @@ This file is a DROP-IN replacement for edge_agent.py.
 import json
 import logging
 import os
-
-# Phase 24B idempotency ledger
-from edge_idempotency import claim as _idem_claim, mark_done as _idem_done
-
 import time
 import hmac
 import hashlib
@@ -25,8 +21,12 @@ from typing import Any, Dict, List, Optional
 import importlib
 import requests
 
+# Phase 24B idempotency ledger (kept; not stripped)
+from edge_idempotency import claim as _idem_claim, mark_done as _idem_done
+
 from telemetry_sender import start_balance_pusher  # existing helper
 from telemetry_sender import _collect_balances
+
 
 # ---------- Config ----------
 
@@ -34,14 +34,19 @@ BASE_URL = (
     (os.getenv("CLOUD_BASE_URL") or os.getenv("BASE_URL") or "").rstrip("/")
     or "https://novatrade3-0.onrender.com"
 )
-EDGE_SECRET = os.getenv("EDGE_SECRET", "")
-AGENT_ID    = os.getenv("AGENT_ID", "edge-primary")
+
+# Secret tolerance: prefer EDGE_SECRET; fall back if needed
+EDGE_SECRET = os.getenv("EDGE_SECRET", "") or ""
+OUTBOX_SECRET = os.getenv("OUTBOX_SECRET", "") or ""
+TELEMETRY_SECRET = os.getenv("TELEMETRY_SECRET", "") or ""
+
+AGENT_ID = os.getenv("AGENT_ID", "edge-primary")
 
 EDGE_MODE = os.getenv("EDGE_MODE", "live").lower()   # "live" or "dryrun"
 EDGE_HOLD = os.getenv("EDGE_HOLD", "false").lower() == "true"
 
 POLL_SECS = float(os.getenv("EDGE_POLL_SECS", "5"))
-TIMEOUT   = float(os.getenv("EDGE_HTTP_TIMEOUT", "15"))
+TIMEOUT = float(os.getenv("EDGE_HTTP_TIMEOUT", "15"))
 
 LOG_LEVEL = os.getenv("EDGE_LOG_LEVEL", "INFO").upper()
 
@@ -59,23 +64,74 @@ def _hmac_sha256_hex(key: str, raw: bytes) -> str:
         return ""
     return hmac.new(key.encode("utf-8"), raw, hashlib.sha256).hexdigest()
 
+
+def _pick_secret() -> str:
+    """
+    Prefer EDGE_SECRET, then OUTBOX_SECRET, then TELEMETRY_SECRET.
+    """
+    return (EDGE_SECRET or OUTBOX_SECRET or TELEMETRY_SECRET or "").strip()
+
+
+def _canonical_json_bytes(body: Dict[str, Any]) -> bytes:
+    """
+    Canonical JSON encoding used for signing and as the exact request body.
+    """
+    return json.dumps(
+        body,
+        separators=(",", ":"),  # no spaces
+        sort_keys=True,         # stable field order
+    ).encode("utf-8")
+
+
+def _signed_headers(sig: str) -> Dict[str, str]:
+    """
+    Put the same signature under multiple header names for Bus compatibility.
+    """
+    headers = {"Content-Type": "application/json"}
+    if not sig:
+        return headers
+
+    # Canonical / modern
+    headers["X-OUTBOX-SIGN"] = sig
+
+    # Legacy/compat variants (HTTP headers are case-insensitive, but we include common spellings)
+    headers["X-NT-Sig"] = sig
+    headers["X-TELEMETRY-SIGN"] = sig
+    headers["X-Nova-Signature"] = sig
+    headers["X-NOVA-SIGNATURE"] = sig
+    headers["X-NOVA-SIGN"] = sig
+
+    return headers
+
+
+def _http_snip(text: str, n: int = 220) -> str:
+    try:
+        s = (text or "").strip().replace("\n", " ")
+        if len(s) > n:
+            return s[:n] + "…"
+        return s
+    except Exception:
+        return ""
+
+
 def _post_json(path: str, body: Dict[str, Any]) -> Any:
     """
     POST signed JSON to the bus.
 
     We always:
       - JSON-serialize with sort_keys=True and compact separators
-      - HMAC that canonical JSON with EDGE_SECRET
-      - Send it as the request body with header X-OUTBOX-SIGN
-    """
-    # Canonical JSON (MUST match Bus)
-    raw_sorted = json.dumps(
-        body,
-        separators=(",", ":"),   # no spaces
-        sort_keys=True           # stable field order
-    ).encode("utf-8")
+      - HMAC that canonical JSON with EDGE/OUTBOX/TELEMETRY secret tolerance
+      - Send it as the request body with multiple signature headers
 
-    sig = _hmac_sha256_hex(EDGE_SECRET, raw_sorted)
+    Returns:
+      - Parsed JSON (dict/list) when possible
+      - None when response is non-json but 2xx
+    Raises:
+      - requests.HTTPError on HTTP >= 400 (with status + snippet)
+    """
+    secret = _pick_secret()
+    raw_sorted = _canonical_json_bytes(body)
+    sig = _hmac_sha256_hex(secret, raw_sorted) if secret else ""
 
     # Debug line so we can see exactly what the Edge is sending
     log.info(
@@ -86,30 +142,45 @@ def _post_json(path: str, body: Dict[str, Any]) -> Any:
     )
 
     url = f"{BASE_URL}{path}"
-    headers = {
-        "Content-Type": "application/json",
-    }
-    if sig:
-        headers["X-OUTBOX-SIGN"] = sig
+    headers = _signed_headers(sig)
 
     r = requests.post(url, data=raw_sorted, headers=headers, timeout=TIMEOUT)
+
+    # Always log the HTTP result (this is the missing visibility that will unblock the leasing issue fast)
+    log.info("http_debug path=%s status=%s snip=%s", path, r.status_code, _http_snip(r.text))
+
     if r.status_code >= 400:
-        raise requests.HTTPError(f"{r.status_code} {r.text}")
+        raise requests.HTTPError(f"{r.status_code} {_http_snip(r.text, 800)}")
+
     try:
         return r.json()
     except Exception:
         return None
 
+
 def bus_pull(lease_limit: int = 1) -> Any:
     """
     Pull NEW commands from /api/commands/pull.
 
-    Body is currently {"limit": N}. agent_id is ignored by the Bus but
-    included for future compatibility.
+    IMPORTANT: We include multiple agent keys because different Bus builds filter differently.
     """
+    aid = str(AGENT_ID).strip()
+    lim = int(lease_limit)
+
     body = {
-        "agent_id": AGENT_ID,
-        "limit": int(lease_limit),
+        # Compatibility agent keys:
+        "agent_id": aid,
+        "agent": aid,
+        "agent_target": aid,
+        "agentId": aid,
+        "agent_name": aid,
+
+        # Paging keys (compat):
+        "limit": lim,
+        "max_items": lim,
+        "n": lim,
+
+        "ts": int(time.time()),
     }
     return _post_json("/api/commands/pull", body)
 
@@ -127,11 +198,20 @@ def bus_ack(cmd_id: int, ok: bool, receipt: Dict[str, Any], *, status: Optional[
       }
     """
     state = status or ("done" if ok else "error")
+    aid = str(AGENT_ID).strip()
+
     body: Dict[str, Any] = {
         "id": int(cmd_id),
-        "agent_id": AGENT_ID,
+        # Keep agent_id canonical, but also include variants for mixed Bus builds
+        "agent_id": aid,
+        "agent": aid,
+        "agent_target": aid,
+        "agentId": aid,
+        "agent_name": aid,
+
         "status": state,
         "receipt": receipt,
+        "ts": int(time.time()),
     }
     return _post_json("/api/commands/ack", body)
 
@@ -150,10 +230,10 @@ def import_exec_for_venue(venue: str):
     We keep a thin mapping from venue name → module path.
     """
     module_map = {
-        "KRAKEN":    "executors.kraken_executor",
+        "KRAKEN": "executors.kraken_executor",
         "BINANCEUS": "executors.binance_us_executor",
         # Coinbase uses the advanced executor variant
-        "COINBASE":  "executors.coinbase_advanced_executor",
+        "COINBASE": "executors.coinbase_advanced_executor",
     }
     mod_name = module_map.get((venue or "").upper())
     if not mod_name:
@@ -169,10 +249,10 @@ def import_exec_for_venue(venue: str):
 # ---------- Intent / receipt helpers ----------
 
 def _simulate_receipt(intent: Dict[str, Any], *, reason: str = "simulated") -> Dict[str, Any]:
-    venue  = (intent.get("venue") or "").upper()
+    venue = (intent.get("venue") or "").upper()
     symbol = intent.get("symbol") or intent.get("pair") or ""
-    side   = (intent.get("side") or "BUY").upper()
-    amt    = float(intent.get("amount_usd") or intent.get("amount") or 0)
+    side = (intent.get("side") or "BUY").upper()
+    amt = float(intent.get("amount_usd") or intent.get("amount") or 0)
 
     return {
         "normalized": True,
@@ -246,7 +326,6 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not isinstance(row, dict):
         return None
 
-    # v2 commands: nested "intent" object plus "payload"
     intent_meta = row.get("intent")
     if not isinstance(intent_meta, dict):
         intent_meta = {}
@@ -257,10 +336,6 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         payload = inner if isinstance(inner, dict) else {}
 
     def pick(key: str, default: Any = None) -> Any:
-        """
-        Look for a key across row → intent_meta → payload.
-        First non-empty (not None / "") wins.
-        """
         for src in (row, intent_meta, payload):
             if isinstance(src, dict) and key in src:
                 val = src.get(key)
@@ -268,25 +343,21 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     return val
         return default
 
-    # Command ID (lives on the row; tolerate legacy cmd_id too)
     cid = pick("id") or pick("cmd_id")
     if not cid:
         return None
 
-    # Venue and symbol
     venue = (pick("venue") or "").upper()
 
     symbol = pick("symbol") or pick("pair") or ""
-    base   = pick("token") or pick("base")
-    quote  = pick("quote") or pick("quote_asset")
+    base = pick("token") or pick("base")
+    quote = pick("quote") or pick("quote_asset")
 
-    # Derive symbol if not explicitly present
     if not symbol and base and quote:
         symbol = f"{str(base).upper()}/{str(quote).upper()}"
 
     side = (pick("side") or "BUY").upper()
 
-    # Amount – treat amount_usd as primary, fall back to generic fields.
     amount_usd = pick("amount_usd")
     if amount_usd is None:
         amount_usd = pick("amount") or pick("amount_base") or pick("amount_quote")
@@ -311,7 +382,6 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "raw": row,
     }
 
-    # Base / quote hints for executors
     if base:
         base_uc = str(base).upper()
         intent.setdefault("token", base_uc)
@@ -320,12 +390,12 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         quote_uc = str(quote).upper()
         intent.setdefault("quote", quote_uc)
 
-    # Mirror agent_id if present anywhere
     agent_id = pick("agent_id")
     if agent_id:
         intent["agent_id"] = agent_id
 
     return intent
+
 
 def _poll_commands() -> List[Dict[str, Any]]:
     """
@@ -343,7 +413,6 @@ def _poll_commands() -> List[Dict[str, Any]]:
     if raw is None:
         return []
 
-    # /api/commands/pull returns a bare list; tolerate wrapper dicts too.
     if isinstance(raw, dict):
         cmds = raw.get("commands") or raw.get("rows") or raw.get("data") or []
     else:
@@ -358,15 +427,13 @@ def _poll_commands() -> List[Dict[str, Any]]:
     for row in cmds:
         intent = _shape_intent_from_row(row)
         if not intent:
-            # Row without ID; nothing we can do.
             continue
 
-        cid    = intent["id"]
-        venue  = intent.get("venue") or ""
+        cid = intent["id"]
+        venue = intent.get("venue") or ""
         symbol = intent.get("symbol") or ""
 
         if not venue or not symbol:
-            # Legacy / malformed rows (e.g. from early experiments).
             msg = f"malformed command id={cid} venue={venue!r} symbol={symbol!r}"
             log.error(msg)
             try:
@@ -395,11 +462,10 @@ def _poll_commands() -> List[Dict[str, Any]]:
 # ---------- Core execution ----------
 
 def execute_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
-    venue  = (intent.get("venue") or "").upper()
+    venue = (intent.get("venue") or "").upper()
     symbol = intent.get("symbol") or intent.get("pair") or ""
-    mode   = (intent.get("mode") or EDGE_MODE).lower()
+    mode = (intent.get("mode") or EDGE_MODE).lower()
 
-    # Global holds / dry-run routing.
     if EDGE_HOLD:
         return _simulate_receipt(intent, reason="EDGE_HOLD")
     if EDGE_MODE != "live" or mode != "live":
@@ -408,11 +474,9 @@ def execute_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
     exec_fn = import_exec_for_venue(venue)
     raw_res = exec_fn(intent)
 
-    # If executor already returned a normalized receipt, trust it.
     if isinstance(raw_res, dict) and raw_res.get("normalized"):
         return raw_res
 
-    # Otherwise, infer ok flag from executor payload (status / ok fields).
     ok_flag = True
     if isinstance(raw_res, dict):
         if "ok" in raw_res:
@@ -420,7 +484,9 @@ def execute_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
         else:
             status = str(raw_res.get("status", "")).lower()
             ok_flag = not status or status == "ok"
+
     return _normalize_receipt(ok_flag, venue, symbol, raw_res)
+
 
 def main() -> None:
     log.info("online — mode=%s hold=%s base=%s agent=%s", EDGE_MODE, EDGE_HOLD, BASE_URL, AGENT_ID)
@@ -429,7 +495,7 @@ def main() -> None:
     try:
         start_balance_pusher()
     except Exception as e:
-            log.error("failed to start balance pusher: %s", e)
+        log.error("failed to start balance pusher: %s", e)
 
     while True:
         intents = _poll_commands()
@@ -438,14 +504,13 @@ def main() -> None:
             continue
 
         for intent in intents:
-            cid    = intent["id"]
-            venue  = intent.get("venue") or ""
+            cid = intent["id"]
+            venue = intent.get("venue") or ""
             symbol = intent.get("symbol") or ""
             log.info("exec cmd=%s agent=%s venue=%s symbol=%s", cid, AGENT_ID, venue, symbol)
 
             try:
                 res = execute_intent(intent)
-                # Use executor-provided ok flag when available.
                 ok = bool(isinstance(res, dict) and res.get("ok", True))
             except Exception as e:
                 log.exception("executor error : %s", e)
@@ -473,8 +538,6 @@ def main() -> None:
             except Exception as e:
                 log.exception("ack failed for cmd=%s : %s", cid, e)
 
-
-        # Slight delay between batches
         time.sleep(POLL_SECS)
 
 
