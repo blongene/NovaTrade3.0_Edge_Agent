@@ -1,62 +1,44 @@
-# edge_bus_client.py — Signed client for Bus command endpoints (Phase 25C auth-tolerant)
-#
-# Endpoints:
-#   POST /api/commands/pull
-#   POST /api/commands/ack
-#
-# Design goals:
-# - Tolerate multiple base URL env var names
-# - Tolerate multiple secret env var names
-# - Tolerate multiple header names seen on the Bus
-# - On 401, automatically try alternate (secret, header) combos
-# - On 429/5xx, bounded retries with backoff
-# - Normalize varying Bus response shapes for pull()
-
-from __future__ import annotations
+# edge_bus_client.py — Signed client for Bus command endpoints
+# - Uses canonical JSON signing (sorted keys, compact separators)
+# - Supports retry/backoff on 429/5xx and timeouts
+# - Auth-fallback loop to quickly try alternate (secret, header) combos
 
 import os
 import json
-import hmac
-import hashlib
 import time
 import random
-from typing import Dict, Any, List, Tuple, Optional
+import hmac
+import hashlib
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 
 # --------------------------------------------------------------------
-# Config helpers
+# Config
 # --------------------------------------------------------------------
 
-def _pick_env(*keys: str) -> str:
-    for k in keys:
-        v = (os.getenv(k) or "").strip()
-        if v:
-            return v
-    return ""
+REQ_TIMEOUT = float(os.getenv("EDGE_BUS_REQ_TIMEOUT", "10"))
+RETRIES = int(os.getenv("EDGE_BUS_RETRIES", "3"))
+BACKOFF0 = float(os.getenv("EDGE_BUS_BACKOFF0", "0.6"))
+
+BASE_URL = (os.getenv("CLOUD_BASE_URL") or os.getenv("BUS_BASE_URL") or os.getenv("BASE_URL") or "").rstrip("/")
+
+
+# --------------------------------------------------------------------
+# Env helpers
+# --------------------------------------------------------------------
+
+def _pick_env(name: str) -> Optional[str]:
+    v = (os.getenv(name) or "").strip()
+    return v or None
 
 
 def _base_url() -> str:
-    base = _pick_env("BUS_BASE_URL", "CLOUD_BASE_URL", "BASE_URL", "PUBLIC_BASE_URL")
-    if not base:
-        raise RuntimeError(
-            "Bus base URL missing. Set BUS_BASE_URL (or CLOUD_BASE_URL/BASE_URL/PUBLIC_BASE_URL)."
-        )
-    if not (base.startswith("http://") or base.startswith("https://")):
-        raise RuntimeError(f"Bus base URL invalid (must start with http/https). Got: {base!r}")
-    return base.rstrip("/")
-
-
-BASE_URL = _base_url()
-
-# Timeouts/backoff
-REQ_TIMEOUT = float(os.environ.get("EDGE_HTTP_TIMEOUT_SECS", "12"))     # seconds (connect/read)
-RETRIES = int(os.environ.get("EDGE_HTTP_RETRIES", "4"))                 # bounded retries for transient errors
-BACKOFF0 = float(os.environ.get("EDGE_HTTP_BACKOFF_SECS", "0.6"))       # base backoff
-DEBUG_AUTH = (os.getenv("EDGE_DEBUG_AUTH") or "").strip().lower() in {"1", "true", "yes"}
-
-_last_pull_log_ts = 0.0  # rate-limit noisy transient errors
+    b = (os.getenv("CLOUD_BASE_URL") or os.getenv("BUS_BASE_URL") or os.getenv("BASE_URL") or "").rstrip("/")
+    if not b:
+        raise RuntimeError("Bus base URL not configured. Set CLOUD_BASE_URL or BUS_BASE_URL on Edge.")
+    return b
 
 
 # --------------------------------------------------------------------
@@ -72,19 +54,42 @@ def _sign_raw(secret: str, raw: str) -> str:
     return hmac.new(secret.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def _signed_headers(sig: str, primary_header: str) -> Dict[str, str]:
+    """Return request headers carrying the same HMAC under multiple header names.
+
+    The Bus has historically accepted several signature header names across phases.
+    We send the signature under a compatibility set so Edge can talk to mixed Bus builds.
+    `primary_header` is included for readability and to preserve the intent of auth-combos.
+    """
+    base = {"Content-Type": "application/json"}
+
+    # Canonical (Phase 24/25)
+    base["X-OUTBOX-SIGN"] = sig
+
+    # Legacy/compat variants (case-insensitive on the wire)
+    base["X-TELEMETRY-SIGN"] = sig
+    base["X-Nova-Signature"] = sig
+    base["X-NOVA-SIGNATURE"] = sig
+    base["X-NOVA-SIGN"] = sig
+    base["X-NT-Sig"] = sig
+
+    # Ensure the combo's primary header is present (even if unusual casing)
+    if primary_header and primary_header not in base:
+        base[primary_header] = sig
+    return base
+
+
 def _secret_candidates() -> List[Tuple[str, str]]:
     """
     Return ordered secret candidates as (env_name, secret_value).
     For commands pull/ack, the bus most commonly uses EDGE_SECRET (X-Nova-Signature)
-    or OUTBOX_SECRET (X-OUTBOX-SIGN / X-NT-Sig), but we tolerate both.
+    or OUTBOX_SECRET (X-OUTBOX-SIGN). TELEMETRY_SECRET is included as a last-resort fallback.
     """
     out: List[Tuple[str, str]] = []
-    seen = set()
-    for env_name in ("EDGE_SECRET", "OUTBOX_SECRET", "TELEMETRY_SECRET"):
-        v = (os.getenv(env_name) or "").strip()
-        if v and v not in seen:
-            seen.add(v)
-            out.append((env_name, v))
+    for env in ("EDGE_SECRET", "OUTBOX_SECRET", "TELEMETRY_SECRET"):
+        v = _pick_env(env)
+        if v:
+            out.append((env, v))
     return out
 
 
@@ -102,11 +107,7 @@ def _auth_combos() -> List[Tuple[str, str, str]]:
       7) TELEMETRY_SECRET fallbacks (last resort)
     """
     secrets = _secret_candidates()
-    if not secrets:
-        return []
-
-    # Map env->secret for easy access
-    by_env = {k: v for (k, v) in secrets}
+    by_env = {k: v for k, v in secrets}
 
     combos: List[Tuple[str, str, str]] = []
     if "EDGE_SECRET" in by_env:
@@ -124,30 +125,29 @@ def _auth_combos() -> List[Tuple[str, str, str]]:
 
     # last resort telemetry secret
     if "TELEMETRY_SECRET" in by_env:
-        combos.append(("TELEMETRY_SECRET", by_env["TELEMETRY_SECRET"], "X-Nova-Signature"))
         combos.append(("TELEMETRY_SECRET", by_env["TELEMETRY_SECRET"], "X-OUTBOX-SIGN"))
+        combos.append(("TELEMETRY_SECRET", by_env["TELEMETRY_SECRET"], "X-Nova-Signature"))
         combos.append(("TELEMETRY_SECRET", by_env["TELEMETRY_SECRET"], "X-NT-Sig"))
 
-    # De-dupe while preserving order
-    seen = set()
-    final: List[Tuple[str, str, str]] = []
-    for item in combos:
-        key = (item[0], item[2], item[1])
-        if key not in seen:
-            seen.add(key)
-            final.append(item)
-    return final
+    return combos
 
+
+# --------------------------------------------------------------------
+# Retry logic
+# --------------------------------------------------------------------
 
 def _retryable_status(code: int) -> bool:
-    return code == 429 or (500 <= code < 600)
+    return int(code) in (408, 409, 425, 429, 500, 502, 503, 504)
 
 
-def _short_text(text: str, limit: int = 200) -> str:
-    t = (text or "").strip()
-    if t.startswith("<!DOCTYPE") or t.startswith("<html"):
-        return "HTML error page (e.g., 502/503)"
-    return (t[:limit] + "…") if len(t) > limit else t
+def _short_text(t: str, n: int = 300) -> str:
+    try:
+        t = (t or "").strip()
+    except Exception:
+        return ""
+    if len(t) <= n:
+        return t
+    return t[:n] + "…"
 
 
 # --------------------------------------------------------------------
@@ -164,12 +164,13 @@ def post_signed(
       - immediate auth-fallback on 401 (tries alternate header/secret combos)
       - bounded retries on 5xx/429 and connection issues
     """
-    url = f"{BASE_URL}{path}"
+    base = _base_url()
+    url = f"{base}{path}"
     raw = _canonical_json(body)
 
     combos = _auth_combos()
     if not combos:
-        raise RuntimeError("No signing secret found. Set EDGE_SECRET or OUTBOX_SECRET on Edge.")
+        raise RuntimeError("No signing secret found. Set EDGE_SECRET or OUTBOX_SECRET (or TELEMETRY_SECRET as fallback) on Edge.")
 
     if timeout is None:
         timeout = (REQ_TIMEOUT, REQ_TIMEOUT)
@@ -179,7 +180,7 @@ def post_signed(
     # 1) Auth fallback loop: exhaust 401s quickly (no backoff).
     for env_name, secret, header_name in combos:
         sig = _sign_raw(secret, raw)
-        headers = {"Content-Type": "application/json", header_name: sig}
+        headers = _signed_headers(sig, header_name)
 
         try:
             r = requests.post(url, data=raw, headers=headers, timeout=timeout)
@@ -195,29 +196,18 @@ def post_signed(
                 return _retry_with_combo(url, raw, headers, timeout, last_exc)
 
             r.raise_for_status()
-
-            if DEBUG_AUTH:
-                print(f"[edge][auth] OK {path} using {env_name} + {header_name}")
-
             return r
 
         except (requests.Timeout, requests.ConnectionError) as e:
             last_exc = e
-            # retry with first combo (or current) via retry loop
-            return _retry_with_combo(url, raw, headers, timeout, last_exc)
+            # go to bounded retry loop with this combo
+            return _retry_with_combo(url, raw, headers, timeout, e)
 
         except requests.HTTPError as e:
-            resp = getattr(e, "response", None)
-            code = getattr(resp, "status_code", None)
-            if code == 401:
-                last_exc = e
-                continue
-            if code is None or not _retryable_status(int(code)):
-                raise
-            last_exc = e
-            return _retry_with_combo(url, raw, headers, timeout, last_exc)
+            # Non-401 auth errors should not be retried across secrets
+            raise
 
-    # If we exhausted combos, surface the clearest 401.
+    # If we exhausted combos due to 401s only
     if last_exc:
         raise last_exc
     raise RuntimeError("post_signed failed without exception")
@@ -236,9 +226,6 @@ def _retry_with_combo(
         try:
             r = requests.post(url, data=raw, headers=headers, timeout=timeout)
 
-            if r.status_code == 401:
-                r.raise_for_status()  # don't retry auth problems here
-
             if _retryable_status(r.status_code):
                 exc = requests.HTTPError(f"{r.status_code} {_short_text(r.text)}", response=r)
             else:
@@ -256,24 +243,23 @@ def _retry_with_combo(
             exc = e
 
         sleep_s = BACKOFF0 * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
-        time.sleep(min(sleep_s, 6.0))
+        time.sleep(min(10.0, sleep_s))
 
     raise exc
 
 
 # --------------------------------------------------------------------
-# Response normalization
+# Response normalization for pull
 # --------------------------------------------------------------------
 
 def _normalize_pull_response(res: Any) -> Dict[str, Any]:
     """
-    Normalize to:
-      {"ok": bool, "commands": [ { "id": ..., "intent": {...} }, ... ], "raw": <original> }
-    Handles common shapes:
+    Normalize possible bus responses:
       - {"ok":true, "commands":[...]}
       - {"ok":true, "items":[...]}
       - {"items":[...]}
       - {"commands":[...]}
+      - {"leased":[...]}
     """
     out: Dict[str, Any] = {"ok": False, "commands": [], "raw": res}
 
@@ -286,22 +272,31 @@ def _normalize_pull_response(res: Any) -> Dict[str, Any]:
             cmds = res.get("leased")
         if cmds is None:
             cmds = []
-        if isinstance(cmds, list):
-            out["ok"] = ok
-            out["commands"] = cmds
-            return out
+        if not isinstance(cmds, list):
+            cmds = []
+        out["ok"] = ok
+        out["commands"] = cmds
+        return out
 
-    # unknown shape
+    # If bus returns list directly
+    if isinstance(res, list):
+        out["ok"] = True
+        out["commands"] = res
+        return out
+
     return out
 
 
 # --------------------------------------------------------------------
-# Convenience
+# Public API: pull + ack
 # --------------------------------------------------------------------
 
-def pull(agent_id: str, limit: int = 1) -> dict:
+_last_pull_log_ts = 0.0
+
+
+def pull(agent_id: str, limit: int = 5, log_every_s: int = 60) -> List[dict]:
     """
-    Pull/lease commands for this agent. Returns normalized dict with `commands` list.
+    Pull leased commands from Bus.
     """
     global _last_pull_log_ts
 
@@ -313,37 +308,38 @@ def pull(agent_id: str, limit: int = 1) -> dict:
         "ts": int(time.time()),
     }
 
+    r = post_signed("/api/commands/pull", body)
+    data = None
     try:
-        r = post_signed("/api/commands/pull", body)
         data = r.json()
-        return _normalize_pull_response(data)
-    except Exception as e:
-        msg = getattr(e, "args", [str(e)])[0]
-        code = getattr(getattr(e, "response", None), "status_code", None)
-        now = time.time()
+    except Exception:
+        data = {"ok": False, "error": "non-json", "raw_text": r.text}
 
-        transient = (code in (502, 503, 504, 429)) or ("HTML error page" in str(msg))
-        if transient:
-            if now - _last_pull_log_ts > 60:
-                print(f"[edge] WARN pull transient {code or ''}: {msg}")
-                _last_pull_log_ts = now
-        else:
-            print(f"[edge] ERROR pull error: {code or ''} {msg}")
+    norm = _normalize_pull_response(data)
+    cmds = norm.get("commands") or []
 
-        return {"ok": False, "commands": [], "error": msg}
+    now = time.time()
+    if log_every_s and (now - _last_pull_log_ts) >= float(log_every_s):
+        _last_pull_log_ts = now
+        print(f"[edge_bus_client] pull ok={norm.get('ok')} n={len(cmds)}")
+
+    return cmds
 
 
-def ack(agent_id: str, cmd_id: int | str, ok: bool, receipt: dict) -> dict:
+def ack(agent_id: str, cmd_id: Any, status: str, receipt: dict) -> dict:
     """
-    ACK command completion back to the bus.
+    ACK a command back to Bus with receipt.
     """
     body = {
         "agent_id": str(agent_id).strip(),
-        "cmd_id": cmd_id,
-        "ok": bool(ok),
+        "id": cmd_id,
+        "status": status,
         "receipt": receipt or {},
         "ts": int(time.time()),
     }
+
     r = post_signed("/api/commands/ack", body)
-    r.raise_for_status()
-    return r.json()
+    try:
+        return r.json()
+    except Exception:
+        return {"ok": False, "error": "non-json", "raw_text": r.text}
