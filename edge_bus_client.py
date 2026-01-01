@@ -1,164 +1,140 @@
-# edge_bus_client.py — Signed client for Bus command endpoints (bulletproof)
-#
-# Key fix: Bus may expect signature in X-OUTBOX-SIGN (Phase 24/25),
-# while some older/other code used X-Nova-Signature.
-# We send BOTH headers to be tolerant.
-#
-# Env:
-#   BUS_BASE_URL or CLOUD_BASE_URL or BASE_URL or PUBLIC_BASE_URL
-#   EDGE_SECRET (preferred) OR OUTBOX_SECRET (fallback)
-#
-# Optional:
-#   EDGE_HTTP_TIMEOUT_SECS, EDGE_HTTP_RETRIES, EDGE_HTTP_BACKOFF_SECS
+#!/usr/bin/env python3
+"""
+edge_bus_client.py
+Client for Edge <-> Bus command leasing endpoints.
+
+Bus expects for /api/commands/pull and /api/commands/ack:
+  HMAC(secret=OUTBOX_SECRET, body=canonical_json) in header X-OUTBOX-SIGN
+
+This fixes Phase 25C 401 Unauthorized by signing correctly.
+"""
 
 from __future__ import annotations
 
-import os
-import json
-import hmac
 import hashlib
+import hmac
+import json
+import os
 import time
-import random
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import requests
 
-_last_pull_log_ts = 0.0  # rate-limit noisy transient errors
+
+DEFAULT_PULL_PATH = "/api/commands/pull"
+DEFAULT_ACK_PATH  = "/api/commands/ack"
+
+DEFAULT_SIGN_HEADER = "X-OUTBOX-SIGN"
+DEFAULT_SECRET_ENV  = "OUTBOX_SECRET"
 
 
-def _pick_env(*keys: str) -> str:
-    for k in keys:
-        v = (os.getenv(k) or "").strip()
-        if v:
-            return v
-    return ""
+def _canonical_json(obj: Any) -> str:
+    # Stable JSON for HMAC: sort keys + compact separators
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def _base_url() -> str:
-    base = _pick_env("BUS_BASE_URL", "CLOUD_BASE_URL", "BASE_URL", "PUBLIC_BASE_URL")
-    if not (base.startswith("http://") or base.startswith("https://")):
+def _get_bus_base_url() -> str:
+    base = (
+        os.getenv("BUS_BASE_URL")
+        or os.getenv("CLOUD_BASE_URL")
+        or os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("BASE_URL")
+        or ""
+    ).strip()
+    if not base:
         raise RuntimeError(
-            f"Bus base URL missing/invalid. Set BUS_BASE_URL (or CLOUD_BASE_URL/BASE_URL/PUBLIC_BASE_URL). Got: {base!r}"
+            "Bus base URL is not set. Set BUS_BASE_URL or CLOUD_BASE_URL "
+            "(e.g. https://novatrade3-0.onrender.com)."
         )
     return base.rstrip("/")
 
 
-BASE_URL = _base_url()
-
-EDGE_SECRET = (_pick_env("EDGE_SECRET", "OUTBOX_SECRET")).strip()
-if not EDGE_SECRET:
-    raise RuntimeError("EDGE_SECRET is not set (must match Bus OUTBOX_SECRET)")
-
-
-# timeouts/backoff
-TIMEOUT = float(os.environ.get("EDGE_HTTP_TIMEOUT_SECS", "12"))
-RETRIES = int(os.environ.get("EDGE_HTTP_RETRIES", "4"))
-BACKOFF0 = float(os.environ.get("EDGE_HTTP_BACKOFF_SECS", "0.6"))
+def _get_outbox_secret() -> str:
+    # Commands pull/ack should be OUTBOX_SECRET. If missing, fail loudly.
+    secret = (os.getenv(DEFAULT_SECRET_ENV) or "").strip()
+    if not secret:
+        raise RuntimeError(
+            "OUTBOX_SECRET is not set on Edge. "
+            "Phase 25C command leasing requires OUTBOX_SECRET to sign /api/commands/*."
+        )
+    return secret
 
 
-def _canonical_json(d: Dict[str, Any]) -> str:
-    # Must match Bus HMAC expectations: stable keys, compact separators
-    return json.dumps(d, separators=(",", ":"), sort_keys=True)
+def _sign(secret: str, body_text: str) -> str:
+    return hmac.new(secret.encode("utf-8"), body_text.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _sign_raw(raw: str) -> str:
-    return hmac.new(EDGE_SECRET.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
+def post_signed(
+    path: str,
+    payload: Dict[str, Any],
+    *,
+    timeout: int = 15,
+    session: Optional[requests.Session] = None,
+) -> requests.Response:
+    """
+    POST JSON with OUTBOX HMAC signature header.
+    """
+    base = _get_bus_base_url()
+    url = base + path
 
+    # include a timestamp to discourage replay + make debugging easier
+    if "ts" not in payload:
+        payload["ts"] = int(time.time())
 
-def _retryable_status(code: int) -> bool:
-    return code == 429 or (500 <= code < 600)
+    body_text = _canonical_json(payload)
+    secret = _get_outbox_secret()
+    sig = _sign(secret, body_text)
 
-
-def _short_html(text: str, limit: int = 160) -> str:
-    t = (text or "").strip()
-    if t.startswith("<!DOCTYPE") or t.startswith("<html"):
-        return "HTML error page (e.g., 502)"
-    return (t[:limit] + "…") if len(t) > limit else t
-
-
-def post_signed(path: str, body: Dict[str, Any], timeout: float | tuple | None = None) -> requests.Response:
-    """Signed POST with automatic retries on 5xx/429 and connection issues."""
-    url = f"{BASE_URL}{path}"
-    raw = _canonical_json(body)
-    sig = _sign_raw(raw)
-
-    # Bulletproof: send both common signature headers
     headers = {
         "Content-Type": "application/json",
-        "X-OUTBOX-SIGN": sig,
-        "X-Nova-Signature": sig,
+        DEFAULT_SIGN_HEADER: sig,
     }
 
-    if timeout is None:
-        timeout = (TIMEOUT, TIMEOUT)
+    s = session or requests.Session()
+    resp = s.post(url, data=body_text.encode("utf-8"), headers=headers, timeout=timeout)
 
-    last_exc: Exception | None = None
-
-    for attempt in range(1, RETRIES + 1):
+    # Helpful hint (no secrets) on auth failures
+    if resp.status_code in (401, 403):
         try:
-            r = requests.post(url, data=raw, headers=headers, timeout=timeout)
+            j = resp.json()
+        except Exception:
+            j = {"raw": resp.text[:200]}
+        print(
+            f"[edge_bus_client] AUTH FAIL {resp.status_code} on {path} "
+            f"(expects {DEFAULT_SECRET_ENV}+{DEFAULT_SIGN_HEADER}). "
+            f"resp={j}"
+        )
 
-            # IMPORTANT: 401/403 are NOT retryable; surface immediately
-            if r.status_code in (401, 403):
-                r.raise_for_status()
-
-            if _retryable_status(r.status_code):
-                last_exc = requests.HTTPError(f"{r.status_code} {_short_html(r.text)}", response=r)
-            else:
-                r.raise_for_status()
-                return r
-
-        except (requests.Timeout, requests.ConnectionError) as e:
-            last_exc = e
-
-        except requests.HTTPError as e:
-            resp = getattr(e, "response", None)
-            code = getattr(resp, "status_code", None)
-            if code is None or not _retryable_status(code):
-                raise
-            last_exc = e
-
-        # jittered exponential backoff
-        sleep_s = BACKOFF0 * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
-        time.sleep(min(sleep_s, 6.0))
-
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("post_signed failed without exception")
+    return resp
 
 
 def pull(agent_id: str, limit: int = 1) -> Dict[str, Any]:
-    """Lease up to `limit` commands for this agent."""
-    global _last_pull_log_ts
-
-    body = {"agent_id": agent_id, "limit": int(limit), "ts": int(time.time())}
+    """
+    Pull/lease commands for this agent.
+    Returns dict parsed from JSON.
+    """
+    payload = {"agent_id": str(agent_id).strip(), "limit": int(limit)}
+    r = post_signed(DEFAULT_PULL_PATH, payload)
     try:
-        r = post_signed("/api/commands/pull", body)
         return r.json()
-    except Exception as e:
-        msg = getattr(e, "args", [str(e)])[0]
-        code = getattr(getattr(e, "response", None), "status_code", None)
-        now = time.time()
-
-        transient = (code in (502, 503, 504, 429)) or ("HTML error page" in str(msg)) or ("<!DOCTYPE" in str(msg))
-        if transient:
-            if now - _last_pull_log_ts > 60:
-                print(f"[edge] WARN pull transient {code or ''}: {msg}")
-                _last_pull_log_ts = now
-        else:
-            print(f"[edge] ERROR pull error: {code or ''} {msg}")
-
-        return {"ok": False, "commands": [], "error": msg}
+    except Exception:
+        return {"ok": False, "status": r.status_code, "text": r.text[:500]}
 
 
-def ack(agent_id: str, cmd_id: int | str, ok: bool, receipt: Dict[str, Any]) -> Dict[str, Any]:
-    """Acknowledge a leased command with a normalized receipt."""
-    body = {
-        "agent_id": agent_id,
-        "cmd_id": cmd_id,
+def ack(agent_id: str, cmd_id: str, ok: bool, receipt: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Ack a leased command back to Bus.
+    """
+    payload: Dict[str, Any] = {
+        "agent_id": str(agent_id).strip(),
+        "cmd_id": str(cmd_id),
         "ok": bool(ok),
-        "receipt": receipt or {},
-        "ts": int(time.time()),
     }
-    r = post_signed("/api/commands/ack", body)
-    return r.json()
+    if receipt is not None:
+        payload["receipt"] = receipt
+
+    r = post_signed(DEFAULT_ACK_PATH, payload)
+    try:
+        return r.json()
+    except Exception:
+        return {"ok": False, "status": r.status_code, "text": r.text[:500]}
