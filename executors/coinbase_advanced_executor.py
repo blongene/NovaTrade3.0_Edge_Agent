@@ -1,10 +1,13 @@
 # executors/coinbase_advanced_executor.py
 # Coinbase Advanced Trade (CDP JWT) executor + balance snapshot
 #
-# BULLETPROOF PATCH (Dec 2025):
-# - Some environments expose jwt_generator at different import paths.
-# - Your Edge runtime currently has `import coinbase` OK, but likely lacks `coinbase.jwt_generator`.
-# - This module now discovers jwt_generator from multiple paths and prints ONE clean diagnostic line.
+# DROP-IN HARDENING (Jan 2026):
+# - Normalize receipt fields consistently with other venue executors (ok/status/message/fills/normalized).
+# - Dryrun returns status="filled" (safe simulation) to match Bus/Edge expectations.
+# - Safer retry policy: retries for GET only; POST is single-attempt (client_order_id remains idempotent).
+# - Low-noise: single diagnostic line for jwt_generator discovery; no verbose printing.
+#
+# Compatibility: Edge Agent calls execute_market_order(intent_dict)
 
 from __future__ import annotations
 
@@ -92,7 +95,7 @@ def _discover_jwt_generator():
             _log(f"jwt_generator OK via import '{mod}'")
             return m
 
-    _log("jwt_generator NOT FOUND in known paths (coinbase-advanced-py install/import mismatch).")
+    _log("jwt_generator NOT FOUND in known paths (install/import mismatch).")
     return None
 
 
@@ -106,10 +109,8 @@ class CoinbaseCDP:
 
     def _ensure_ready(self):
         if not jwt_generator:
-            # This message is intentionally explicit: it’s the single most common failure mode.
             raise RuntimeError(
-                "Missing jwt_generator. Your environment has `import coinbase` but not a compatible "
-                "jwt_generator module. Ensure coinbase-advanced-py is installed and not shadowed by "
+                "Missing jwt_generator. Ensure coinbase-advanced-py is installed and not shadowed by "
                 "a different `coinbase` package."
             )
         if not (self.key_name and self.private_key):
@@ -129,15 +130,18 @@ class CoinbaseCDP:
         }
         data = json.dumps(body) if body is not None else None
 
-        # A tiny retry helps with transient Coinbase 5xx / network blips.
+        # Retry policy:
+        # - GET: small retry for transient Coinbase 5xx / network blips
+        # - POST: single attempt (client_order_id provides idempotency, but we avoid accidental duplicates)
+        tries = 3 if method.upper() == "GET" else 1
         last = None
-        for i in range(3):
+        for i in range(tries):
             try:
-                r = requests.request(method, url, headers=headers, data=data, timeout=TIMEOUT_S)
-                return r
+                return requests.request(method, url, headers=headers, data=data, timeout=TIMEOUT_S)
             except Exception as e:
                 last = e
-                time.sleep(1.25 * (i + 1))
+                if i < tries - 1:
+                    time.sleep(1.25 * (i + 1))
         raise RuntimeError(f"COINBASE request failed: {last}")
 
     def balances(self) -> Dict[str, float]:
@@ -154,16 +158,16 @@ class CoinbaseCDP:
         except Exception:
             raise RuntimeError(f"COINBASE accounts non-json: {r.text[:240]}")
 
-        # Expected: {"accounts":[...]}
         accts = j.get("accounts") if isinstance(j, dict) else None
         if not isinstance(accts, list):
-            # Some variations: {"data":{"accounts":[...]}}
             data = j.get("data") if isinstance(j, dict) else None
             if isinstance(data, dict) and isinstance(data.get("accounts"), list):
                 accts = data.get("accounts")
 
         if not isinstance(accts, list):
-            raise RuntimeError(f"COINBASE accounts response shape unexpected: keys={list(j.keys()) if isinstance(j, dict) else type(j)}")
+            raise RuntimeError(
+                f"COINBASE accounts response shape unexpected: keys={list(j.keys()) if isinstance(j, dict) else type(j)}"
+            )
 
         out: Dict[str, float] = {}
 
@@ -171,7 +175,7 @@ class CoinbaseCDP:
             if not isinstance(a, dict):
                 continue
 
-            # --- currency symbol ---
+            # currency symbol
             cur = a.get("currency") or {}
             if isinstance(cur, dict):
                 sym = cur.get("symbol") or cur.get("code") or ""
@@ -182,7 +186,7 @@ class CoinbaseCDP:
             if not sym:
                 continue
 
-            # --- available balance ---
+            # available balance
             bal = a.get("available_balance")
             if isinstance(bal, dict):
                 val = bal.get("value", 0)
@@ -215,9 +219,7 @@ class CoinbaseCDP:
             "client_order_id": client_order_id or "",
             "product_id": product_id,
             "side": side_uc,
-            "order_configuration": {
-                "market_market_ioc": {}
-            },
+            "order_configuration": {"market_market_ioc": {}},
         }
 
         cfg = body["order_configuration"]["market_market_ioc"]
@@ -243,6 +245,31 @@ def _norm_symbol(venue_symbol: str) -> str:
     return (venue_symbol or "BTC/USDC").upper().replace("/", "-").strip()
 
 
+def _norm_receipt(
+    *,
+    ok: bool,
+    status: str,
+    message: str,
+    venue: str,
+    symbol: str,
+    side: str,
+    fills: list,
+    **extra,
+) -> Dict[str, Any]:
+    r: Dict[str, Any] = {
+        "ok": bool(ok),
+        "status": status,
+        "message": message,
+        "fills": fills or [],
+        "venue": venue,
+        "symbol": symbol,
+        "side": side,
+        "normalized": True,
+    }
+    r.update(extra)
+    return r
+
+
 def execute_market_order(
     intent: Optional[Dict[str, Any]] = None,
     *,
@@ -255,34 +282,17 @@ def execute_market_order(
     edge_hold: bool = False,
     **kwargs,
 ) -> Dict[str, Any]:
-    """Execute a market order on Coinbase Advanced (CDP JWT).
-
-    COMPATIBILITY:
-      - Edge Agent calls: execute_market_order(intent_dict)
-      - Legacy callers may call: execute_market_order(venue_symbol=..., side=..., amount_quote=...)
-
-    INTENT FIELDS (best-effort):
-      - symbol / pair : "BTC/USDC" or "BTC-USDC"
-      - side          : BUY/SELL
-      - amount_usd or amount_quote or amount : treated as QUOTE sizing
-      - amount_base   : optional base sizing
-      - mode / edge_mode, edge_hold
-      - id/cmd_id used to synthesize a stable client_order_id if not provided
-    """
-    # Merge intent dict + kwargs into local variables (intent wins for core fields).
+    """Execute a market order on Coinbase Advanced (CDP JWT)."""
     it = intent if isinstance(intent, dict) else {}
-    # Venue symbol (Coinbase product_id) normalization happens below.
+
     venue_symbol = (it.get("symbol") or it.get("pair") or venue_symbol or "BTC/USDC")
     requested = str(venue_symbol).upper()
 
-    # Side
     side_uc = (it.get("side") or side or "BUY").upper()
 
-    # Edge mode / hold
     edge_mode = str(it.get("mode") or it.get("edge_mode") or edge_mode or "dryrun").lower()
     edge_hold = bool(it.get("edge_hold") if "edge_hold" in it else edge_hold)
 
-    # Amounts
     def _f(x: Any) -> float:
         try:
             return float(x)
@@ -292,90 +302,89 @@ def execute_market_order(
     amount_quote = _f(it.get("amount_quote") or it.get("amount_usd") or it.get("amount") or amount_quote)
     amount_base = _f(it.get("amount_base") or amount_base)
 
-    # Normalize symbol to Coinbase product_id (BTC/USDC -> BTC-USDC)
     symbol = _norm_symbol(str(venue_symbol))
 
-    # Stable client order id (Coinbase accepts empty, but we prefer deterministic).
+    # Stable client order id (deterministic)
     client_id = (it.get("client_id") or it.get("client_order_id") or client_id or "").strip()
     if not client_id:
         cmd_id = it.get("id") or it.get("cmd_id") or int(time.time())
         agent = (it.get("agent_id") or it.get("agent") or os.getenv("EDGE_AGENT_ID") or os.getenv("AGENT_ID") or "edge")
-        # Keep short: 36-ish chars max
         raw = f"{agent}:{cmd_id}:{symbol}:{side_uc}"
         digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:18]
         client_id = f"nt-{str(cmd_id)[:10]}-{digest}"
 
-    # Safety: sizing must be > 0, but do not hard-fail on base sizing if quote is present.
     if amount_quote <= 0 and amount_base <= 0:
-        return {
-            "ok": False,
-            "status": "error",
-            "message": "amount_quote/amount_usd (quote sizing) or amount_base must be > 0",
-            "fills": [],
-            "venue": "COINBASE",
-            "symbol": symbol,
-            "requested_symbol": requested,
-            "resolved_symbol": symbol,
-            "side": side_uc,
-        }
+        return _norm_receipt(
+            ok=False,
+            status="error",
+            message="amount_quote/amount_usd (quote sizing) or amount_base must be > 0",
+            venue="COINBASE",
+            symbol=symbol,
+            side=side_uc,
+            fills=[],
+            requested_symbol=requested,
+            resolved_symbol=symbol,
+        )
 
-    # Optional precheck: Coinbase often rejects too-small orders. Let operator set a floor.
+    # Optional floor
     try:
         min_quote = float(os.getenv("COINBASE_MIN_QUOTE", os.getenv("COINBASE_MIN_NOTIONAL", "0")) or 0.0)
     except Exception:
         min_quote = 0.0
     if min_quote and amount_quote and amount_quote < min_quote:
-        return {
-            "ok": False,
-            "status": "rejected",
-            "message": f"amount_quote below COINBASE_MIN_QUOTE floor ({amount_quote} < {min_quote})",
-            "fills": [],
-            "venue": "COINBASE",
-            "symbol": symbol,
-            "requested_symbol": requested,
-            "resolved_symbol": symbol,
-            "side": side_uc,
-            "amount_quote": amount_quote,
-            "amount_base": amount_base,
-        }
+        return _norm_receipt(
+            ok=False,
+            status="rejected",
+            message=f"amount_quote below COINBASE_MIN_QUOTE floor ({amount_quote} < {min_quote})",
+            venue="COINBASE",
+            symbol=symbol,
+            side=side_uc,
+            fills=[],
+            requested_symbol=requested,
+            resolved_symbol=symbol,
+            amount_quote=amount_quote,
+            amount_base=amount_base,
+            client_id=client_id,
+        )
 
     if edge_hold:
-        return {
-            "ok": True,
-            "status": "held",
-            "message": "EDGE_HOLD enabled",
-            "fills": [],
-            "venue": "COINBASE",
-            "symbol": symbol,
-            "requested_symbol": requested,
-            "resolved_symbol": symbol,
-            "side": side_uc,
-            "amount_quote": amount_quote,
-            "amount_base": amount_base,
-            "client_id": client_id,
-        }
+        return _norm_receipt(
+            ok=True,
+            status="held",
+            message="EDGE_HOLD enabled",
+            venue="COINBASE",
+            symbol=symbol,
+            side=side_uc,
+            fills=[],
+            requested_symbol=requested,
+            resolved_symbol=symbol,
+            amount_quote=amount_quote,
+            amount_base=amount_base,
+            client_id=client_id,
+        )
 
     if edge_mode != "live":
-        return {
-            "ok": True,
-            "status": "dryrun",
-            "message": "dryrun mode — not placing live Coinbase order",
-            "fills": [],
-            "venue": "COINBASE",
-            "symbol": symbol,
-            "requested_symbol": requested,
-            "resolved_symbol": symbol,
-            "side": side_uc,
-            "amount_quote": amount_quote,
-            "amount_base": amount_base,
-            "client_id": client_id,
-        }
+        # IMPORTANT: status="filled" so the Bus/ledger paths treat this as a completed simulated execution.
+        return _norm_receipt(
+            ok=True,
+            status="filled",
+            message="dryrun mode — simulated Coinbase market fill (no live order placed)",
+            venue="COINBASE",
+            symbol=symbol,
+            side=side_uc,
+            fills=[],
+            requested_symbol=requested,
+            resolved_symbol=symbol,
+            amount_quote=amount_quote,
+            amount_base=amount_base,
+            client_id=client_id,
+            dry_run=True,
+        )
 
     # Live execution
     try:
         cb = CoinbaseCDP()
 
-        # Snapshot balances pre (best effort)
         pre = {}
         try:
             pre = cb.balances()
@@ -390,14 +399,13 @@ def execute_market_order(
             client_order_id=client_id,
         )
 
-        # Snapshot balances post (best effort)
         post = {}
         try:
             post = cb.balances()
         except Exception:
             post = {}
 
-        # Extract a txid/order_id if present
+        # Try to extract an order id
         txid = ""
         if isinstance(res, dict):
             txid = (
@@ -407,32 +415,36 @@ def execute_market_order(
                 or ""
             )
 
-        return {
-            "ok": True,
-            "status": "ok",
-            "venue": "COINBASE",
-            "symbol": symbol,
-            "requested_symbol": requested,
-            "resolved_symbol": symbol,
-            "side": side_uc,
-            "txid": txid,
-            "client_id": client_id,
-            "fills": [],  # Coinbase may require separate fills endpoint; keep raw for Bus
-            "raw": res,
-            "pre_balances": pre,
-            "post_balances": post,
-        }
+        # Coinbase returns acceptance; IOC market should generally fill, but we keep conservative "open" if uncertain.
+        status = "filled" if txid else "open"
+
+        return _norm_receipt(
+            ok=True,
+            status=status,
+            message="order accepted" if txid else "order submitted",
+            venue="COINBASE",
+            symbol=symbol,
+            side=side_uc,
+            fills=[],
+            txid=txid,
+            client_id=client_id,
+            raw=res,
+            pre_balances=pre,
+            post_balances=post,
+            requested_symbol=requested,
+            resolved_symbol=symbol,
+        )
 
     except Exception as e:
-        return {
-            "ok": False,
-            "status": "error",
-            "message": str(e),
-            "fills": [],
-            "venue": "COINBASE",
-            "symbol": symbol,
-            "requested_symbol": requested,
-            "resolved_symbol": symbol,
-            "side": side_uc,
-            "client_id": client_id,
-        }
+        return _norm_receipt(
+            ok=False,
+            status="error",
+            message=str(e),
+            venue="COINBASE",
+            symbol=symbol,
+            side=side_uc,
+            fills=[],
+            client_id=client_id,
+            requested_symbol=requested,
+            resolved_symbol=symbol,
+        )
