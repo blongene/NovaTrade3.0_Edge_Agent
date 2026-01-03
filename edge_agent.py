@@ -358,14 +358,41 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     side = (pick("side") or "BUY").upper()
 
-    amount_usd = pick("amount_usd")
-    if amount_usd is None:
-        amount_usd = pick("amount") or pick("amount_base") or pick("amount_quote")
-
+    # Preserve intent flags (used for base-vs-quote sizing signals)
+    flags = pick("flags") or pick("intent_flags") or []
     try:
-        amount_usd_f = float(amount_usd) if amount_usd is not None else 0.0
+        flags_l = [str(x).lower() for x in (flags if isinstance(flags, (list, tuple)) else [flags])]
     except Exception:
-        amount_usd_f = 0.0
+        flags_l = []
+
+    raw_amount = pick("amount")
+    raw_amount_usd = pick("amount_usd")
+    raw_amount_quote = pick("amount_quote")
+    raw_amount_base = pick("amount_base")
+
+    def _to_f(v: Any) -> float:
+        try:
+            return float(v) if v not in (None, "") else 0.0
+        except Exception:
+            return 0.0
+
+    amount_base_f = _to_f(raw_amount_base)
+    amount_quote_f = _to_f(raw_amount_quote)
+
+    # Legacy/compat: some paths use generic `amount`. Interpret it based on flags.
+    if raw_amount is not None and raw_amount not in ("", None):
+        if amount_base_f == 0.0 and ("base" in flags_l):
+            amount_base_f = _to_f(raw_amount)
+        elif amount_quote_f == 0.0 and raw_amount_usd in (None, ""):
+            # Default: treat generic `amount` as quote sizing (BUY-style)
+            amount_quote_f = _to_f(raw_amount)
+
+    # amount_usd is kept for backward compatibility; prefer explicit quote sizing for BUY
+    amount_usd_f = _to_f(raw_amount_usd)
+    if amount_usd_f == 0.0 and amount_quote_f > 0.0:
+        amount_usd_f = amount_quote_f
+    if amount_usd_f == 0.0 and amount_base_f > 0.0:
+        amount_usd_f = amount_base_f
 
     mode = (pick("mode") or EDGE_MODE).lower()
     note = pick("note") or ""
@@ -376,7 +403,12 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "venue": venue,
         "symbol": symbol,
         "side": side,
+        # Backward compatible amount field
         "amount_usd": amount_usd_f,
+        # Explicit sizing fields (preferred)
+        "amount_quote": amount_quote_f,
+        "amount_base": amount_base_f,
+        "flags": flags if isinstance(flags, (list, tuple)) else [flags],
         "mode": mode,
         "note": note,
         "raw": row,
