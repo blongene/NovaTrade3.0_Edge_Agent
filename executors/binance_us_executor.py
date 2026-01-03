@@ -175,11 +175,9 @@ def parse_symbol(s: str) -> Tuple[str, str]:
 
 class BinanceUS:
     def __init__(self) -> None:
-        self.api_key = os.getenv("BINANCE_API_KEY")
-        self.secret_key = os.getenv("BINANCE_SECRET_KEY") or os.getenv(
-            "BINANCE_API_SECRET"
-        )
-        self.base_url = "https://api.binance.us"
+        self.api_key = os.getenv("BINANCEUS_API_KEY") or os.getenv("BINANCE_API_KEY")
+        self.secret_key = (os.getenv("BINANCEUS_API_SECRET") or os.getenv("BINANCE_SECRET_KEY") or os.getenv("BINANCE_API_SECRET"))
+        self.base_url = (os.getenv("BINANCEUS_BASE_URL") or os.getenv("BINANCE_BASE_URL") or "https://api.binance.us").rstrip("/")
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -298,6 +296,7 @@ def binance_execution_wrapper(
     # HOLD path
     if str(edge_hold).lower() in ("true", "1", "yes"):
         return {
+            "ok": False,
             "status": "held",
             "message": "EDGE_HOLD is enabled",
             "fills": [],
@@ -305,13 +304,17 @@ def binance_execution_wrapper(
 
     # Dry-run path
     if edge_mode == "dry":
+        # Treat dry-run as "success" for pipeline validation, but with zeroed fills.
         return {
-            "status": "closed",
+            "ok": True,
+            "status": "filled",
             "filled": True,
             "fills": [],
             "message": "dry_run",
+            # keep both keys for downstream compatibility
+            "avg_price": 0.0,
             "average_price": 0.0,
-            "executed_qty": amount_base if amount_base else 0.0,
+            "executed_qty": float(amount_base or 0.0),
         }
 
     # Live execution
@@ -359,18 +362,22 @@ def binance_execution_wrapper(
 
         avg_price = (total_cost / total_qty) if total_qty else 0.0
 
+        filled = (res.get("status") in ("FILLED", "PARTIALLY_FILLED")) or (float(res.get("executedQty", 0) or 0.0) > 0.0)
         return {
-            "status": "closed" if res.get("status") == "FILLED" else "open",
-            "filled": res.get("status") == "FILLED",
+            "ok": bool(filled),
+            "status": "filled" if filled else "open",
+            "filled": bool(filled),
             "fills": fills,
             "executed_qty": float(res.get("executedQty", 0)),
+            # keep both keys for downstream compatibility
             "avg_price": avg_price,
+            "average_price": avg_price,
             "raw": res,
         }
 
     except Exception as e:
         _log(f"Binance execution failed: {e}")
-        return {"status": "error", "message": str(e), "fills": []}
+        return {"ok": False, "status": "error", "message": str(e), "fills": []}
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +691,7 @@ def exec_command(cmd: Dict[str, Any], balances_cache: Optional[Dict[str, Dict[st
 
     if EDGE_HOLD:
         return {
+            "ok": False,
             "status": "held",
             "message": "EDGE_HOLD enabled",
             "fills": [],
