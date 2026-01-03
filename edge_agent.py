@@ -354,46 +354,48 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     quote = pick("quote") or pick("quote_asset")
 
     if not symbol and base and quote:
-        symbol = f"{str(base).upper()}/{str(quote).upper()}"
+        symbol = f"{str(base).upper()}/{str(quote).upper()}"    side = (pick("side") or "BUY").upper()
 
-    side = (pick("side") or "BUY").upper()
-
-    # Preserve intent flags (used for base-vs-quote sizing signals)
+    # Preserve sizing fields so executors can correctly build venue-specific orders.
+    # - BUY often uses quote sizing (amount_quote / amount_usd / amount)
+    # - SELL (esp Coinbase) requires base sizing (amount_base)
     flags = pick("flags") or pick("intent_flags") or []
+    if isinstance(flags, (str, int, float)):
+        flags = [flags]
+    flags_l = []
     try:
-        flags_l = [str(x).lower() for x in (flags if isinstance(flags, (list, tuple)) else [flags])]
+        flags_l = [str(x).lower() for x in flags]
     except Exception:
         flags_l = []
 
-    raw_amount = pick("amount")
-    raw_amount_usd = pick("amount_usd")
-    raw_amount_quote = pick("amount_quote")
-    raw_amount_base = pick("amount_base")
+    amount_base = pick("amount_base")
+    amount_quote = pick("amount_quote")
 
-    def _to_f(v: Any) -> float:
+    # Back-compat: some callers use amount_usd or amount.
+    amount_usd = pick("amount_usd")
+
+    # If amount_quote not explicitly set, interpret `amount` as quote unless flagged as base.
+    raw_amount = pick("amount")
+    if amount_quote is None and amount_usd is not None:
+        amount_quote = amount_usd
+    if amount_quote is None and raw_amount is not None and ("base" not in flags_l):
+        amount_quote = raw_amount
+
+    # If base sizing is intended (flags contain "base" or explicit amount_base), allow `amount` to map to base.
+    if amount_base is None and raw_amount is not None and ("base" in flags_l):
+        amount_base = raw_amount
+
+    def _f(x):
         try:
-            return float(v) if v not in (None, "") else 0.0
+            return float(x) if x is not None else 0.0
         except Exception:
             return 0.0
 
-    amount_base_f = _to_f(raw_amount_base)
-    amount_quote_f = _to_f(raw_amount_quote)
+    amount_base_f = _f(amount_base)
+    amount_quote_f = _f(amount_quote)
 
-    # Legacy/compat: some paths use generic `amount`. Interpret it based on flags.
-    if raw_amount is not None and raw_amount not in ("", None):
-        if amount_base_f == 0.0 and ("base" in flags_l):
-            amount_base_f = _to_f(raw_amount)
-        elif amount_quote_f == 0.0 and raw_amount_usd in (None, ""):
-            # Default: treat generic `amount` as quote sizing (BUY-style)
-            amount_quote_f = _to_f(raw_amount)
-
-    # amount_usd is kept for backward compatibility; prefer explicit quote sizing for BUY
-    amount_usd_f = _to_f(raw_amount_usd)
-    if amount_usd_f == 0.0 and amount_quote_f > 0.0:
-        amount_usd_f = amount_quote_f
-    if amount_usd_f == 0.0 and amount_base_f > 0.0:
-        amount_usd_f = amount_base_f
-
+    # Legacy amount_usd: keep for older executors, but do NOT auto-copy base sizing into amount_usd.
+    amount_usd_f = _f(amount_usd if amount_usd is not None else amount_quote_f)
     mode = (pick("mode") or EDGE_MODE).lower()
     note = pick("note") or ""
 
@@ -403,12 +405,11 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "venue": venue,
         "symbol": symbol,
         "side": side,
-        # Backward compatible amount field
         "amount_usd": amount_usd_f,
-        # Explicit sizing fields (preferred)
-        "amount_quote": amount_quote_f,
         "amount_base": amount_base_f,
-        "flags": flags if isinstance(flags, (list, tuple)) else [flags],
+        "amount_quote": amount_quote_f,
+        "flags": flags,
+
         "mode": mode,
         "note": note,
         "raw": row,
