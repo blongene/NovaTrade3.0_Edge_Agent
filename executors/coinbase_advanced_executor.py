@@ -290,29 +290,29 @@ def execute_market_order(
             return 0.0
 
     raw_amount = it.get("amount")
-    amount_base = _f(it.get("amount_base") or amount_base)
-
-    # Quote sizing (BUY default) — but be careful: some injectors/paths use generic `amount`.
-    # If flags indicate base sizing, treat `amount` as base. If SELL and amount_base is provided, prefer base sizing.
-    flags = it.get("flags") or it.get("intent_flags") or []
+    raw_flags = it.get("flags") or it.get("intent_flags") or []
     try:
-        flags_l = [str(x).lower() for x in (flags if isinstance(flags, (list, tuple)) else [flags])]
+        flags_l = [str(x).lower() for x in (raw_flags if isinstance(raw_flags, (list, tuple)) else [raw_flags])]
     except Exception:
         flags_l = []
 
-    # Start with explicit quote fields only (amount_quote/amount_usd). Fall back to `amount` ONLY if it looks like quote intent.
+    # Prefer explicit fields
+    amount_base = _f(it.get("amount_base") or amount_base)
     amount_quote = _f(it.get("amount_quote") or it.get("amount_usd") or 0.0)
-    if amount_quote == 0.0 and raw_amount is not None:
-        if "base" in flags_l or "amount_base" in it:
-            # treat `amount` as base if flagged
-            if amount_base == 0.0:
-                amount_base = _f(raw_amount)
-        else:
-            # treat `amount` as quote by default (BUY-style)
+
+    # If generic `amount` exists, interpret based on flags/side
+    if raw_amount is not None:
+        if "base" in flags_l and amount_base == 0.0:
+            amount_base = _f(raw_amount)
+        elif amount_quote == 0.0 and amount_base == 0.0:
+            # default: treat as quote sizing
             amount_quote = _f(raw_amount)
 
-    # SELL safety: Coinbase market sells must be parameterized in base currency.
-    if side_uc == "SELL" and amount_base > 0:
+    # Coinbase rule: MARKET SELLS must be parameterized in BASE currency.
+    if side_uc == "SELL":
+        if amount_base == 0.0 and raw_amount is not None and amount_quote > 0.0:
+            # if caller provided only `amount`/quote, treat it as base for SELL
+            amount_base = amount_quote
         amount_quote = 0.0
 
     # Normalize symbol to Coinbase product_id (BTC/USDC -> BTC-USDC)
@@ -412,6 +412,27 @@ def execute_market_order(
             base_size=float(amount_base or 0.0),
             client_order_id=client_id,
         )
+
+        # Coinbase may return HTTP 200 with {"success": false, "error_response": {...}}
+        # Treat this as a hard error (normalized) rather than ok:true.
+        if isinstance(res, dict) and res.get("success") is False:
+            err = (res.get("error_response") or {})
+            msg = err.get("message") or err.get("error") or "coinbase order rejected"
+            return {
+                "ok": False,
+                "status": "error",
+                "message": str(msg),
+                "fills": [],
+                "venue": "COINBASE",
+                "symbol": symbol,
+                "requested_symbol": requested,
+                "resolved_symbol": symbol,
+                "side": side_uc,
+                "raw": res,
+                "pre_balances": pre,
+                "post_balances": pre,
+                "normalized": True,
+            }
 
         # Snapshot balances post (best effort)
         post = {}
