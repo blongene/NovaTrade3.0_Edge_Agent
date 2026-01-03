@@ -354,7 +354,8 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     quote = pick("quote") or pick("quote_asset")
 
     if not symbol and base and quote:
-        symbol = f"{str(base).upper()}/{str(quote).upper()}"    side = (pick("side") or "BUY").upper()
+        symbol = f"{str(base).upper()}/{str(quote).upper()}"
+        side = (pick("side") or "BUY").upper()
 
     # Preserve sizing fields so executors can correctly build venue-specific orders.
     # - BUY often uses quote sizing (amount_quote / amount_usd / amount)
