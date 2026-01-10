@@ -267,6 +267,29 @@ def _simulate_receipt(intent: Dict[str, Any], *, reason: str = "simulated") -> D
     }
 
 
+def _dryrun_receipt(intent: Dict[str, Any], *, reason: str = "dryrun") -> Dict[str, Any]:
+    """Return an ok receipt for dryrun execution without hitting any venue."""
+    venue = (intent.get("venue") or "").upper()
+    symbol = intent.get("symbol") or intent.get("pair") or ""
+    side = (intent.get("side") or "BUY").upper()
+    amt_usd = float(intent.get("amount_usd") or intent.get("amount") or 0)
+    amt_base = intent.get("amount_base")
+    amt_quote = intent.get("amount_quote")
+    return {
+        "normalized": True,
+        "ok": True,
+        "status": "dryrun",
+        "venue": venue,
+        "symbol": symbol,
+        "side": side,
+        "amount_usd": amt_usd,
+        "amount_base": amt_base,
+        "amount_quote": amt_quote,
+        "reason": reason,
+        "raw_intent": intent,
+    }
+
+
 def _normalize_receipt(ok: bool, venue: str, symbol: str, raw: Dict[str, Any]) -> Dict[str, Any]:
     """
     Wrap executor-specific receipts into a common shape.
@@ -472,32 +495,24 @@ def _poll_commands() -> List[Dict[str, Any]]:
 def execute_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
     venue = (intent.get("venue") or "").upper()
     symbol = intent.get("symbol") or intent.get("pair") or ""
-    intent_type = str(intent.get("type") or "trade").strip().lower()
     mode = (intent.get("mode") or EDGE_MODE).lower()
+    intent_type = (intent.get("type") or "").lower()
 
-    # --- No-op intents -------------------------------------------------
-    # Some Bus phases (e.g., Phase 26D-preview) enqueue "note" intents that
-    # are meant to be audited/acknowledged by the Edge, not executed on an
-    # exchange. Historically, unknown types were routed through the trade/
-    # order executors, which can produce false negatives (e.g., missing sizing).
-    #
-    # We treat these as successful no-ops and ACK them as done.
-    if intent_type in {"note", "noop", "watch_intent_preview", "watch_intent", "watch"}:
-        raw_row = intent.get("raw") if isinstance(intent.get("raw"), dict) else {}
-        nested_intent = raw_row.get("intent") if isinstance(raw_row.get("intent"), dict) else {}
-        payload = nested_intent.get("payload") if isinstance(nested_intent.get("payload"), dict) else {}
-        # Prefer the Bus-provided note if present.
-        note = intent.get("note") or payload.get("note") or "note/noop intent acknowledged"
+    # Informational intents should never call an executor.
+    if intent_type in {"note", "noop"}:
         return {
             "normalized": True,
             "ok": True,
             "status": "noop",
             "venue": venue,
             "symbol": symbol,
-            "message": str(note),
-            "intent_type": intent_type,
+            "message": f"{intent_type} intent acknowledged",
             "raw_intent": intent,
         }
+
+    # Phase 26D-preview / Alpha dryruns: allow full pipe without placing live orders.
+    if intent_type == "order.place" and bool(intent.get("dry_run")):
+        return _dryrun_receipt(intent, reason="order.place dry_run")
 
     if EDGE_HOLD:
         return _simulate_receipt(intent, reason="EDGE_HOLD")
