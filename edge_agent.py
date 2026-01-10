@@ -472,7 +472,32 @@ def _poll_commands() -> List[Dict[str, Any]]:
 def execute_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
     venue = (intent.get("venue") or "").upper()
     symbol = intent.get("symbol") or intent.get("pair") or ""
+    intent_type = str(intent.get("type") or "trade").strip().lower()
     mode = (intent.get("mode") or EDGE_MODE).lower()
+
+    # --- No-op intents -------------------------------------------------
+    # Some Bus phases (e.g., Phase 26D-preview) enqueue "note" intents that
+    # are meant to be audited/acknowledged by the Edge, not executed on an
+    # exchange. Historically, unknown types were routed through the trade/
+    # order executors, which can produce false negatives (e.g., missing sizing).
+    #
+    # We treat these as successful no-ops and ACK them as done.
+    if intent_type in {"note", "noop", "watch_intent_preview", "watch_intent", "watch"}:
+        raw_row = intent.get("raw") if isinstance(intent.get("raw"), dict) else {}
+        nested_intent = raw_row.get("intent") if isinstance(raw_row.get("intent"), dict) else {}
+        payload = nested_intent.get("payload") if isinstance(nested_intent.get("payload"), dict) else {}
+        # Prefer the Bus-provided note if present.
+        note = intent.get("note") or payload.get("note") or "note/noop intent acknowledged"
+        return {
+            "normalized": True,
+            "ok": True,
+            "status": "noop",
+            "venue": venue,
+            "symbol": symbol,
+            "message": str(note),
+            "intent_type": intent_type,
+            "raw_intent": intent,
+        }
 
     if EDGE_HOLD:
         return _simulate_receipt(intent, reason="EDGE_HOLD")
