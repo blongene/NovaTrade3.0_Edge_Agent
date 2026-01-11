@@ -307,37 +307,59 @@ def _normalize_receipt(ok: bool, venue: str, symbol: str, raw: Dict[str, Any]) -
 
 # ---------- Command pull/shape ----------
 
+from typing import Any, Dict, Optional
+
 def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Translate a /api/commands/pull row into a normalized intent dict.
 
-    This is a compatibility bridge between multiple command shapes (legacy + newer).
-
-    Key guarantees:
+    Compatibility bridge:
+      - Supports "new" Bus shape: {"intent": {"type": "...", "payload": {...}}}
+      - Supports legacy/flat shapes where fields exist at top-level or inside "command"
       - Always sets side (default BUY)
-      - Preserves amount_base / amount_quote when provided (critical for SELL base-sizing)
-      - Preserves flags (e.g., ["base"]) so executors can interpret intent correctly
-      - Keeps amount_usd for backward compatibility (treated as quote sizing by some venues)
+      - Preserves amount_base/amount_quote/amount_usd correctly
+      - Preserves flags, and auto-adds "base" when amount_base is used
     """
-
     if not isinstance(row, dict):
         return None
 
-    # Some buses nest the intent under "intent" or "command"
+    # Identify where the command lives
     it = row.get("intent") if isinstance(row.get("intent"), dict) else None
     if not it:
         it = row.get("command") if isinstance(row.get("command"), dict) else None
+    if not it and isinstance(row.get("intent_json"), dict):
+        it = row.get("intent_json")
     if not it:
-        it = row
+        it = row  # fallback: treat row as intent-like dict
+
+    # New shape often nests the real fields under payload
+    payload = it.get("payload") if isinstance(it, dict) and isinstance(it.get("payload"), dict) else {}
+    # Some older buses nest command-ish fields under "command" in the intent
+    cmd2 = it.get("command") if isinstance(it, dict) and isinstance(it.get("command"), dict) else {}
 
     def pick(k: str) -> Any:
-        if isinstance(it, dict) and k in it and it[k] is not None:
-            return it[k]
-        if k in row and row[k] is not None:
-            return row[k]
+        """
+        Priority:
+          1) payload (new shape)
+          2) it (intent dict)
+          3) cmd2 (nested command dict)
+          4) row (top-level)
+        """
+        for src in (payload, it, cmd2, row):
+            if isinstance(src, dict) and k in src and src[k] is not None:
+                return src[k]
         return None
 
-    # Flags (keep as list of strings)
+    def _to_f(x: Any) -> float:
+        try:
+            if x is None:
+                return 0.0
+            # allow numeric strings
+            return float(x)
+        except Exception:
+            return 0.0
+
+    # Flags (keep as list[str])
     flags_raw = pick("flags") or pick("intent_flags") or []
     if isinstance(flags_raw, (list, tuple)):
         flags = [str(x) for x in flags_raw]
@@ -347,12 +369,32 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         flags = []
     flags_l = [f.lower() for f in flags]
 
+    # Type
+    intent_type = pick("type") or pick("command_type") or "trade"
+    try:
+        intent_type = str(intent_type)
+    except Exception:
+        intent_type = "trade"
+
+    # Venue
+    venue = pick("venue") or ""
+    try:
+        venue = str(venue).upper()
+    except Exception:
+        venue = ""
+
     # Symbol and base/quote tokenization
     base = pick("base") or pick("token")
     quote = pick("quote")
     symbol = pick("symbol") or pick("pair") or ""
+
     if not symbol and base and quote:
         symbol = f"{str(base).upper()}/{str(quote).upper()}"
+    else:
+        try:
+            symbol = str(symbol)
+        except Exception:
+            symbol = ""
 
     # Side must ALWAYS be defined
     side_raw = pick("side") or "BUY"
@@ -360,56 +402,95 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         side = str(side_raw).upper()
     except Exception:
         side = "BUY"
+    if side not in ("BUY", "SELL"):
+        side = "BUY"
 
     # Amounts:
-    # - Prefer explicit amount_base / amount_quote
-    # - For legacy, keep amount_usd (or amount) as quote sizing
-    amount_base = pick("amount_base")
-    amount_quote = pick("amount_quote") or pick("amount_usd")
-    amount_any = pick("amount")
-
-    def _to_f(x: Any) -> float:
-        try:
-            if x is None:
-                return 0.0
-            return float(x)
-        except Exception:
-            return 0.0
-
-    amount_base_f = _to_f(amount_base)
-    amount_quote_f = _to_f(amount_quote)
+    # Prefer explicit amount_base/amount_quote/amount_usd from payload/new shape.
+    amount_base_f = _to_f(pick("amount_base"))
+    amount_quote_f = _to_f(pick("amount_quote"))
     amount_usd_f = _to_f(pick("amount_usd"))
 
-    # If amount_usd is not explicitly set, fall back to amount (legacy)
-    if amount_usd_f == 0.0 and amount_any is not None:
-        # If flags indicate base sizing, treat `amount` as base.
-        if "base" in flags_l and amount_base_f == 0.0:
-            amount_base_f = _to_f(amount_any)
-        else:
-            # Default: treat `amount` as quote sizing (BUY-style)
-            if amount_quote_f == 0.0:
-                amount_quote_f = _to_f(amount_any)
-            if amount_usd_f == 0.0:
-                amount_usd_f = _to_f(amount_any)
+    # Legacy fallback: "amount"
+    amount_any = pick("amount")
+    amount_any_f = _to_f(amount_any)
 
-    # Build intent
+    # If amount_usd not present, some systems used amount as quote sizing by default
+    # But if flags/base sizing is indicated, treat amount as base.
+    if amount_any is not None and amount_any_f > 0:
+        if ("base" in flags_l) and amount_base_f <= 0:
+            amount_base_f = amount_any_f
+        else:
+            # quote sizing default
+            if amount_quote_f <= 0:
+                amount_quote_f = amount_any_f
+            if amount_usd_f <= 0:
+                amount_usd_f = amount_any_f
+
+    # Normalize BUY vs SELL sizing expectations:
+    # - BUY should carry quote sizing (amount_usd and/or amount_quote)
+    # - SELL should carry base sizing (amount_base)
+    if side == "BUY":
+        # Prefer amount_usd as canonical for buy sizing if provided
+        if amount_usd_f > 0 and amount_quote_f <= 0:
+            amount_quote_f = amount_usd_f
+        elif amount_quote_f > 0 and amount_usd_f <= 0:
+            amount_usd_f = amount_quote_f
+    else:  # SELL
+        # If SELL and amount_base is missing but quote sizing exists, do NOT silently convert;
+        # many venues require base sizing for sells. Keep as-is but ensure flags reflect base if base exists.
+        if amount_base_f > 0 and "base" not in flags_l:
+            flags.append("base")
+            flags_l.append("base")
+
+    # Dry-run detection
+    dry_run_val = pick("dry_run")
+    if dry_run_val is None:
+        mode = str(pick("mode") or "").lower()
+        dry_run = (mode == "dryrun") or (mode == "preview") or (mode == "translation_preview_only")
+    else:
+        dry_run = bool(dry_run_val)
+
+    # Idempotency/client id
+    client_order_id = (
+        pick("client_order_id") or
+        pick("client_id") or
+        pick("idempotency_key") or
+        pick("clientOrderId")
+    )
+    idempotency_key = (
+        pick("idempotency_key") or
+        pick("client_order_id") or
+        pick("client_id") or
+        pick("clientOrderId")
+    )
+
+    # Build intent (normalized)
     intent: Dict[str, Any] = {
         "id": pick("id") or row.get("id"),
-        "type": (pick("type") or pick("command_type") or "trade"),
-        "venue": (pick("venue") or "").upper(),
+        "type": intent_type,
+        "venue": venue,
         "symbol": symbol,
         "side": side,
-        # Back-compat: some executors look at amount_usd as quote sizing
+
+        # Back-compat: some executors look at amount_usd as quote sizing for BUY
         "amount_usd": amount_usd_f,
-        # Preferred: preserve explicit sizing
+
+        # Preferred explicit sizing
         "amount_base": amount_base_f,
         "amount_quote": amount_quote_f,
+
         "flags": flags,
-        "dry_run": bool(pick("dry_run")) if pick("dry_run") is not None else (str(pick("mode") or "").lower() == "dryrun"),
-        "client_order_id": pick("client_order_id") or pick("client_id") or pick("idempotency_key"),
-        "idempotency_key": pick("idempotency_key") or pick("client_order_id") or pick("client_id"),
+        "dry_run": dry_run,
+
+        "client_order_id": client_order_id,
+        "idempotency_key": idempotency_key,
+
         "note": pick("note") or pick("reason") or "",
+        # Keep raw for debugging
         "raw": row,
+        "raw_intent": it,
+        "raw_payload": payload,
     }
 
     # Derive token/base/quote fields if present
