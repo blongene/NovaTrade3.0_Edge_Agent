@@ -309,92 +309,141 @@ def _normalize_receipt(ok: bool, venue: str, symbol: str, raw: Dict[str, Any]) -
 
 def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Normalize a Bus /api/commands/pull row into a strict executor-safe intent.
+    Normalize a /api/commands/pull row into a fully executor-safe intent.
 
-    Guarantees:
-    - BUY  → quote sizing ONLY (amount_usd)
-    - SELL → base sizing ONLY (amount_base)
-    - Never sends zero-sized orders
-    - Side is always correct
-    - Coinbase Advanced compatible
-    - Dry-run safe
+    Phase 26E hardened:
+      - BUY => quote sizing (amount_usd / amount_quote > 0)
+      - SELL => base sizing (amount_base > 0)
+      - Never zeroes valid amounts
+      - Never emits an intent with no positive size
     """
 
     if not isinstance(row, dict):
         return None
 
-    # Extract intent envelope
-    it = row.get("intent") if isinstance(row.get("intent"), dict) else row
+    # Unwrap nested intent shapes
+    it = row.get("intent") if isinstance(row.get("intent"), dict) else None
+    if not it:
+        it = row.get("command") if isinstance(row.get("command"), dict) else None
+    if not it:
+        it = row
 
-    def pick(k: str):
-        return it.get(k) if k in it and it[k] is not None else row.get(k)
+    def pick(k: str) -> Any:
+        if k in it and it[k] is not None:
+            return it[k]
+        if k in row and row[k] is not None:
+            return row[k]
+        return None
 
-    # ---- Core fields ----
+    # ---------- Flags ----------
+    flags_raw = pick("flags") or pick("intent_flags") or []
+    if isinstance(flags_raw, (list, tuple)):
+        flags = [str(f) for f in flags_raw]
+    elif flags_raw:
+        flags = [str(flags_raw)]
+    else:
+        flags = []
+
+    flags_l = [f.lower() for f in flags]
+
+    # ---------- Symbol ----------
+    base = pick("base") or pick("token")
+    quote = pick("quote")
+    symbol = pick("symbol") or pick("pair") or ""
+
+    if not symbol and base and quote:
+        symbol = f"{str(base).upper()}/{str(quote).upper()}"
+
+    # ---------- Side ----------
     side = str(pick("side") or "BUY").upper()
-    venue = str(pick("venue") or "").upper()
-    symbol = pick("symbol") or ""
+    if side not in ("BUY", "SELL"):
+        side = "BUY"
 
-    token = pick("token")
-    if not symbol and token:
-        symbol = f"{token}/USD"
-
-    # ---- Amounts ----
-    def f(x):
+    # ---------- Amount parsing helpers ----------
+    def f(x: Any) -> float:
         try:
+            if x is None:
+                return 0.0
             return float(x)
         except Exception:
             return 0.0
 
-    amount_usd = f(pick("amount_usd") or pick("amount_quote"))
-    amount_base = f(pick("amount_base"))
+    # Explicit amounts first
+    amount_base_f = f(pick("amount_base"))
+    amount_quote_f = f(pick("amount_quote"))
+    amount_usd_f = f(pick("amount_usd"))
 
-    # ---- STRICT SIZING RULES ----
-    if side == "BUY":
-        if amount_usd <= 0:
-            return None  # hard skip invalid BUY
-        amount_base = 0.0  # MUST be zero for Coinbase BUY
+    # Legacy fallback
+    amount_any_f = f(pick("amount"))
 
-    elif side == "SELL":
-        if amount_base <= 0:
-            return None  # hard skip invalid SELL
-        amount_usd = 0.0  # MUST be zero for Coinbase SELL
+    # ---------- BUY / SELL enforcement ----------
+    if side == "SELL":
+        # SELL must be base-sized
+        if amount_base_f <= 0.0:
+            if amount_any_f > 0.0:
+                amount_base_f = amount_any_f
+        if amount_base_f <= 0.0:
+            # Invalid SELL intent — skip safely
+            return None
+        if "base" not in flags_l:
+            flags.append("base")
 
-    # ---- Intent hash / idempotency ----
-    idem = (
-        pick("idempotency_key")
-        or pick("client_order_id")
-        or pick("client_id")
-        or f"edge-{row.get('id')}"
-    )
+        # Ensure quote sizing is zeroed (executor clarity)
+        amount_quote_f = 0.0
+        amount_usd_f = 0.0
 
-    # ---- Dry-run detection ----
+    else:  # BUY
+        # BUY must be quote-sized
+        if amount_quote_f <= 0.0:
+            if amount_usd_f > 0.0:
+                amount_quote_f = amount_usd_f
+            elif amount_any_f > 0.0:
+                amount_quote_f = amount_any_f
+
+        if amount_quote_f <= 0.0:
+            # Invalid BUY intent — skip safely
+            return None
+
+        # Back-compat
+        amount_usd_f = amount_quote_f
+        amount_base_f = 0.0
+
+    # ---------- Dryrun ----------
     dry_run = bool(
         pick("dry_run")
-        or str(pick("mode") or "").lower() == "dryrun"
+        if pick("dry_run") is not None
+        else str(pick("mode") or "").lower() == "dryrun"
     )
 
-    # ---- Build final intent ----
-    intent = {
-        "id": row.get("id"),
-        "type": str(pick("type") or "order.place"),
-        "venue": venue,
+    # ---------- Build intent ----------
+    intent: Dict[str, Any] = {
+        "id": pick("id") or row.get("id"),
+        "type": pick("type") or pick("command_type") or "order.place",
+        "venue": str(pick("venue") or "").upper(),
         "symbol": symbol,
         "side": side,
-
-        # STRICT sizing
-        "amount_usd": amount_usd,
-        "amount_base": amount_base,
-
+        "amount_base": amount_base_f,
+        "amount_quote": amount_quote_f,
+        "amount_usd": amount_usd_f,  # legacy compatibility
+        "flags": flags,
         "dry_run": dry_run,
-        "idempotency_key": idem,
-
-        "meta": pick("meta") or {},
-        "note": pick("note") or "",
+        "idempotency_key": (
+            pick("idempotency_key")
+            or pick("client_order_id")
+            or pick("client_id")
+        ),
+        "note": pick("note") or pick("reason") or "",
         "raw": row,
     }
 
-    if token:
-        intent["token"] = str(token).upper()
+    # ---------- Token helpers ----------
+    if base:
+        b = str(base).upper()
+        intent.setdefault("token", b)
+        intent.setdefault("base", b)
+
+    if quote:
+        intent.setdefault("quote", str(quote).upper())
 
     agent_id = pick("agent_id")
     if agent_id:
