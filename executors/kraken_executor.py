@@ -15,26 +15,15 @@ import os, time, hmac, hashlib, base64, urllib.parse, requests
 from typing import Dict, Any, Tuple, Optional
 from .kraken_util import to_kraken_altname
 
+# ---- Intent canonicalization helper (Bus/Edge compatibility) ----
+try:
+    from .common import canonicalize_order_place_intent
+except Exception:  # pragma: no cover
+    try:
+        from executors.common import canonicalize_order_place_intent
+    except Exception:
+        from common import canonicalize_order_place_intent  # type: ignore
 
-def _canonicalize_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
-    """Accept both flat and nested-payload intent shapes.
-
-    Some Bus phases stored `order.place` sizing fields under intent['payload'].
-    This executor should be tolerant so old/new Bus builds can interoperate.
-    """
-    if not isinstance(intent, dict):
-        return {}
-    payload = intent.get("payload")
-    if not isinstance(payload, dict):
-        return intent
-
-    merged: Dict[str, Any] = dict(intent)
-    for k, v in payload.items():
-        if k not in merged or merged.get(k) in (None, ""):
-            merged[k] = v
-    # keep nested payload for provenance/debug
-    merged["payload"] = payload
-    return merged
 
 BASE = os.getenv("KRAKEN_BASE_URL", "https://api.kraken.com").rstrip("/")
 KEY  = os.getenv("KRAKEN_KEY", "")
@@ -277,9 +266,6 @@ def _execute_market_order_core(
 def execute_market_order(intent: dict | None = None) -> Dict[str, Any]:
     if not intent:
         return {"status": "noop", "message": "no intent provided", "normalized": True, "ok": False}
-
-    # Tolerate nested payload shapes produced by some Bus phases.
-    intent = _canonicalize_intent(intent)
 
     venue_symbol = intent.get("symbol") or intent.get("pair") or "BTC/USDT"
     side = intent.get("side") or "BUY"
