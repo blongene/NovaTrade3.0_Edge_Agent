@@ -679,8 +679,64 @@ def execute_market(
     )
 
 
+# ---- Intent canonicalization (Bus / Edge compatibility) ----
+# Some producers wrap order.place sizing inside intent['payload'] (e.g.
+# {"type":"order.place","payload":{... amount_usd ...}}).
+# This helper promotes commonly used fields from nested payload -> root without
+# breaking older shapes.
+
+from copy import deepcopy
+
+_CANON_PROMOTE_KEYS = (
+    "venue","symbol","token","side","mode","note","flags",
+    "amount_usd","amount_quote","amount_base",
+    "price","price_usd","limit_price","time_in_force",
+    "dry_run","idempotency_key","client_order_id","meta"
+)
+
+
+def _canonicalize_intent(intent: Any) -> Dict[str, Any]:
+    if not isinstance(intent, dict):
+        return {}
+    out = dict(intent)
+    payload = out.get("payload")
+    if isinstance(payload, dict):
+        # Promote missing/empty fields
+        for k in _CANON_PROMOTE_KEYS:
+            if out.get(k) in (None, "", [], {}):
+                v = payload.get(k)
+                if v not in (None, ""):
+                    out[k] = v
+        # Ensure type normalization
+        itype = (out.get("type") or payload.get("type") or "").strip()
+        if itype:
+            out["type"] = itype
+        # Side normalization
+        if isinstance(out.get("side"), str):
+            out["side"] = out["side"].upper()
+        # Default quote sizing
+        if out.get("amount_quote") in (None, "", 0, 0.0) and out.get("amount_usd") not in (None, "", 0, 0.0):
+            out["amount_quote"] = out.get("amount_usd")
+        # Safe float coercion for sizing
+        for nk in ("amount_usd","amount_quote","amount_base","price","price_usd","limit_price"):
+            if nk in out and out[nk] not in (None, ""):
+                try:
+                    out[nk] = float(out[nk])
+                except Exception:
+                    pass
+        # Backfill payload so older consumers still find promoted fields there
+        new_payload = dict(payload)
+        for k in _CANON_PROMOTE_KEYS:
+            if new_payload.get(k) in (None, "", [], {}):
+                if out.get(k) not in (None, ""):
+                    new_payload[k] = out.get(k)
+        out["payload"] = new_payload
+    return out
+
+
 def exec_command(cmd: Dict[str, Any], balances_cache: Optional[Dict[str, Dict[str, float]]] = None) -> Dict[str, Any]:
-    payload = cmd.get("intent") or cmd.get("payload") or {}
+    raw = cmd.get("intent") or cmd.get("payload") or {}
+    payload = _canonicalize_intent(raw)
     venue = (payload.get("venue") or "").upper()
     side = (payload.get("side") or "").upper()
     symbol = payload.get("symbol") or payload.get("product_id") or ""
