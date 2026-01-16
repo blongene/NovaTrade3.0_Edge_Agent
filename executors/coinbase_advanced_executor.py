@@ -25,6 +25,32 @@ TIMEOUT_S = int(os.getenv("COINBASE_TIMEOUT_S", "15"))
 UA = os.getenv("EDGE_USER_AGENT", "NovaTradeEdge/3.0")
 
 
+def _canonicalize_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
+    """Accept both shapes:
+      A) flat: {type, venue, symbol, side, amount_usd/amount_quote/amount_base, ...}
+      B) nested: {type, venue, symbol, payload:{side, amount_usd, ...}}
+
+    The Bus historically stored some order.place sizing fields under payload.
+    We merge payload keys into the top level without clobbering explicit top-level keys.
+    """
+    if not isinstance(intent, dict):
+        return {}
+    out: Dict[str, Any] = dict(intent)
+    payload = intent.get("payload")
+    if isinstance(payload, dict):
+        for k, v in payload.items():
+            if k not in out or out.get(k) in (None, "", [], {}):
+                out[k] = v
+    # Common aliases / fallbacks
+    if out.get("dry_run") is None and out.get("dryrun") is not None:
+        out["dry_run"] = bool(out.get("dryrun"))
+    if out.get("amount_quote") is None and out.get("quote_amount") is not None:
+        out["amount_quote"] = out.get("quote_amount")
+    if out.get("client_order_id") is None and out.get("idempotency_key") is not None:
+        out["client_order_id"] = out.get("idempotency_key")
+    return out
+
+
 def _log(msg: str) -> None:
     # Keep Edge logs low-noise but visible.
     print(f"[coinbase_adv] {msg}")
@@ -271,6 +297,7 @@ def execute_market_order(
     """
     # Merge intent dict + kwargs into local variables (intent wins for core fields).
     it = intent if isinstance(intent, dict) else {}
+    it = _canonicalize_intent(it)
     # Venue symbol (Coinbase product_id) normalization happens below.
     venue_symbol = (it.get("symbol") or it.get("pair") or venue_symbol or "BTC/USDC")
     requested = str(venue_symbol).upper()
