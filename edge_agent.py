@@ -507,6 +507,15 @@ def _poll_commands() -> List[Dict[str, Any]]:
 
     intents: List[Dict[str, Any]] = []
 
+    # System / informational intents that do not require venue+symbol routing.
+    # These are expected to be handled locally (or simulated) and ACKed as ok.
+    NON_SYMBOL_TYPES = {
+        "balance_snapshot",
+        "heartbeat",
+        "note",
+        "noop",
+    }
+
     for row in cmds:
         intent = _shape_intent_from_row(row)
         if not intent:
@@ -515,8 +524,10 @@ def _poll_commands() -> List[Dict[str, Any]]:
         cid = intent["id"]
         venue = intent.get("venue") or ""
         symbol = intent.get("symbol") or ""
+        intent_type = (intent.get("type") or "").lower().strip()
 
-        if not venue or not symbol:
+        # Only enforce venue/symbol presence for trade-like intents.
+        if intent_type not in NON_SYMBOL_TYPES and (not venue or not symbol):
             msg = f"malformed command id={cid} venue={venue!r} symbol={symbol!r}"
             log.error(msg)
             try:
@@ -550,8 +561,8 @@ def execute_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
     mode = (intent.get("mode") or EDGE_MODE).lower()
     intent_type = (intent.get("type") or "").lower()
 
-    # Informational intents should never call an executor.
-    if intent_type in {"note", "noop"}:
+    # Informational / system intents should never require an exchange executor.
+    if intent_type in {"note", "noop", "heartbeat"}:
         return {
             "normalized": True,
             "ok": True,
@@ -559,6 +570,40 @@ def execute_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
             "venue": venue,
             "symbol": symbol,
             "message": f"{intent_type} intent acknowledged",
+            "raw_intent": intent,
+        }
+
+    # BALANCE_SNAPSHOT: refresh balances and (best-effort) push telemetry.
+    # This intent is safe in any mode; if Edge is not live it still produces
+    # a useful snapshot receipt for the Bus.
+    if intent_type == "balance_snapshot":
+        snapshot: Dict[str, Any] = {}
+        try:
+            from executors.binance_us_executor import get_balances as _get_balances  # type: ignore
+            snapshot = _get_balances() or {}
+        except Exception as e:
+            return {
+                "normalized": True,
+                "ok": False,
+                "status": "error",
+                "error": f"balance_snapshot_failed: {e}",
+                "raw_intent": intent,
+            }
+
+        # Best-effort push to Bus telemetry endpoints if configured.
+        try:
+            import telemetry_sync  # type: ignore
+            if hasattr(telemetry_sync, "push_telemetry"):
+                telemetry_sync.push_telemetry()  # type: ignore
+        except Exception:
+            pass
+
+        return {
+            "normalized": True,
+            "ok": True,
+            "status": "ok",
+            "message": "balance snapshot captured",
+            "balances": snapshot,
             "raw_intent": intent,
         }
 
