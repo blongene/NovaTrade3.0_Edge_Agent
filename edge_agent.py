@@ -425,10 +425,11 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             amount_quote_f = 0.0
             amount_usd_f = 0.0
 
-    # Determine dry_run
+    # Determine dry_run and mode
     dry_run_val = pick("dry_run")
     mode_val = str(pick("mode") or "").lower()
     dry_run = bool(dry_run_val) if dry_run_val is not None else (mode_val == "dryrun")
+    mode = mode_val or ("dryrun" if dry_run else "live")
 
     # Determine type
     intent_type = pick("type") or pick("command_type") or "trade"
@@ -446,7 +447,8 @@ def _shape_intent_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "venue": venue,
         "symbol": symbol,
         "side": side,
-
+        "dry_run": dry_run,
+        "mode": mode,
         # Back-compat: some executors look at amount_usd as quote sizing
         "amount_usd": float(amount_usd_f),
 
@@ -606,6 +608,10 @@ def execute_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
             "balances": snapshot,
             "raw_intent": intent,
         }
+
+    # Universal dryrun guard
+    if bool(intent.get("dry_run")):
+        return _dryrun_receipt(intent, reason="intent dry_run")
 
     # Phase 26D-preview / Alpha dryruns: allow full pipe without placing live orders.
     if intent_type == "order.place" and bool(intent.get("dry_run")):
