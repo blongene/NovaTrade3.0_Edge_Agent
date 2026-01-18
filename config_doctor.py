@@ -101,3 +101,40 @@ def emit_once(prefix: str = "CONFIG") -> DoctorResult:
         # Never block startup because of the doctor
         print(f"[{prefix}] WARN 1 — config_doctor_failed")
         return DoctorResult(ok=False, warnings=["config_doctor_failed"], hints=[])
+
+
+def run_edge_config_doctor():
+    """
+    Stable entrypoint for Phase 29 config validation.
+    Returns: {"status": "PASS"|"WARN", "warnings": [..]}
+    """
+    # If your module already has some internal checker function(s),
+    # call them here. We'll fall back to the generic checks inline.
+    warnings = []
+
+    import os
+
+    def _val(k: str) -> str:
+        v = os.getenv(k, "")
+        return v.strip()
+
+    # 1) Secret separation
+    edge = _val("EDGE_SECRET")
+    tel  = _val("TELEMETRY_SECRET")
+    out  = _val("OUTBOX_SECRET")
+
+    if edge and tel and edge == tel:
+        warnings.append("EDGE_SECRET equals TELEMETRY_SECRET (blast radius)")
+    if edge and out and edge == out:
+        warnings.append("EDGE_SECRET equals OUTBOX_SECRET (blast radius)")
+    if tel and out and tel == out:
+        warnings.append("TELEMETRY_SECRET equals OUTBOX_SECRET (blast radius)")
+
+    # 2) Binance var ambiguity
+    has_bus  = bool(_val("BINANCEUS_API_KEY") or _val("BINANCEUS_API_SECRET") or _val("BINANCEUS_BASE_URL"))
+    has_bin  = bool(_val("BINANCE_API_KEY") or _val("BINANCE_API_SECRET") or _val("BINANCE_BASE_URL"))
+    if has_bus and has_bin:
+        warnings.append("Both BINANCEUS_* and BINANCE_* are set (routing ambiguity)")
+
+    status = "PASS" if not warnings else "WARN"
+    return {"status": status, "warnings": warnings}
