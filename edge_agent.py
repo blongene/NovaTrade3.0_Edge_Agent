@@ -1,3 +1,5 @@
+print("EDGE_BOOT_MARKER_PHASE29")
+
 #!/usr/bin/env python3
 """
 NovaTrade 3.0 Edge Agent (unified, HMAC-signed)
