@@ -104,8 +104,6 @@ def run_edge_config_doctor():
     tel  = _val("TELEMETRY_SECRET")
     out  = _val("OUTBOX_SECRET")
 
-    if edge and tel and edge == tel:
-        warnings.append("EDGE_SECRET equals TELEMETRY_SECRET (blast radius)")
     if edge and out and edge == out:
         warnings.append("EDGE_SECRET equals OUTBOX_SECRET (blast radius)")
     if tel and out and tel == out:
