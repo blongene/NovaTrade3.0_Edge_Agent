@@ -33,6 +33,10 @@ from typing import Any, Dict, List, Optional
 
 from edge_bus_client import pull, ack
 
+# Phase 29 safety: report config risks (warnings only) + hard gate live execution
+from config_doctor import emit_once as _config_emit_once
+from safety_doctrine import live_gate
+
 
 def _pick_env(*keys: str, default: str = "") -> str:
     for k in keys:
@@ -194,13 +198,13 @@ def _execute_one(cmd: Dict[str, Any]) -> None:
         _ack_ok(cid, _simulate_receipt(cmd, reason="EDGE_HOLD"))
         return
 
-    # intent-level override supported, but edge mode is the top-level safety rail
+    # intent-level override supported, but *live* must be explicitly armed
     intent = cmd.get("intent") or {}
-    intent_mode = str(intent.get("mode") or "").lower().strip()
-    effective_mode = intent_mode or EDGE_MODE
+    intent_mode = str(intent.get("mode") or "").lower().strip() or None
 
-    if EDGE_MODE != "live" or effective_mode != "live":
-        _ack_ok(cid, _simulate_receipt(cmd, reason=f"mode=edge:{EDGE_MODE} intent:{effective_mode or 'unset'}"))
+    gate = live_gate(intent_mode=intent_mode)
+    if not gate.allowed:
+        _ack_ok(cid, _simulate_receipt(cmd, reason=gate.reason))
         return
 
     exec_fn = _resolve_executor()
@@ -241,6 +245,9 @@ def poll_once() -> int:
 def run_forever() -> None:
     global _last_info_ts, _last_empty_ts
     base = _pick_env("BUS_BASE_URL", "CLOUD_BASE_URL", "BASE_URL", "PUBLIC_BASE_URL", default="")
+
+    # One-line config health at startup (warnings only)
+    _config_emit_once(prefix="EDGE_CONFIG")
 
     print(f"[edge] bus poller online — agent={AGENT_ID} mode={EDGE_MODE} hold={EDGE_HOLD} base={base}")
 
