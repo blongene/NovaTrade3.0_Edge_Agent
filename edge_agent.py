@@ -62,6 +62,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("edge")
 
+def _truthy(v: str) -> bool:
+    return str(v or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+EDGE_HTTP_DEBUG = _truthy(os.getenv("EDGE_HTTP_DEBUG", "0"))
+EDGE_HMAC_DEBUG = _truthy(os.getenv("EDGE_HMAC_DEBUG", "0"))
+
 # --- Phase29: Config Doctor boot-line (warn-only) ---
 try:
     from config_doctor import run_edge_config_doctor
@@ -153,12 +159,13 @@ def _post_json(path: str, body: Dict[str, Any]) -> Any:
     sig = _hmac_sha256_hex(secret, raw_sorted) if secret else ""
 
     # Debug line so we can see exactly what the Edge is sending
-    log.info(
-        "hmac_debug path=%s body=%s sig=%s",
-        path,
-        raw_sorted.decode("utf-8"),
-        sig or "<empty>",
-    )
+    if EDGE_HMAC_DEBUG:
+        log.info(
+            "hmac_debug path=%s body=%s sig=%s",
+            path,
+            raw_sorted.decode("utf-8"),
+            sig or "<empty>",
+        )
 
     url = f"{BASE_URL}{path}"
     headers = _signed_headers(sig)
@@ -166,7 +173,13 @@ def _post_json(path: str, body: Dict[str, Any]) -> Any:
     r = requests.post(url, data=raw_sorted, headers=headers, timeout=TIMEOUT)
 
     # Always log the HTTP result (this is the missing visibility that will unblock the leasing issue fast)
-    log.info("http_debug path=%s status=%s snip=%s", path, r.status_code, _http_snip(r.text))
+    if EDGE_HTTP_DEBUG:
+        log.info(
+            "http_debug path=%s status=%s snip=%s",
+            path,
+            r.status_code,
+            _http_snip(r.text),
+        )
 
     if r.status_code >= 400:
         raise requests.HTTPError(f"{r.status_code} {_http_snip(r.text, 800)}")
