@@ -1,4 +1,4 @@
-print("EDGE_BOOT_MARKER_PHASE29")
+print("EDGE_BOOT_MARKER_PHASE29", flush=True)
 
 #!/usr/bin/env python3
 """
