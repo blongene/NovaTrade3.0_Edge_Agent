@@ -43,25 +43,6 @@ def diagnose() -> DoctorResult:
         warnings.append("EDGE_MODE=live but LIVE_ARMED!=YES (will be hard-blocked)")
         hints.append("Set LIVE_ARMED=YES only when intentionally going live")
 
-    # 2) Secret separation
-    edge_secret = _env("EDGE_SECRET")
-    telemetry_secret = _env("TELEMETRY_SECRET")
-    outbox_secret = _env("OUTBOX_SECRET")
-    if _same(edge_secret, telemetry_secret):
-        warnings.append("EDGE_SECRET equals TELEMETRY_SECRET (blast radius)")
-        hints.append("Use distinct secrets for command auth vs telemetry")
-    if _same(edge_secret, outbox_secret) and outbox_secret:
-        warnings.append("EDGE_SECRET equals OUTBOX_SECRET (blast radius)")
-    if _same(telemetry_secret, outbox_secret) and outbox_secret:
-        warnings.append("TELEMETRY_SECRET equals OUTBOX_SECRET (blast radius)")
-
-    # 3) Duplicate Binance vars (BinanceUS vs BINANCE)
-    binanceus_key = _env("BINANCEUS_API_KEY")
-    binance_key = _env("BINANCE_API_KEY")
-    if binanceus_key and binance_key:
-        warnings.append("Both BINANCEUS_* and BINANCE_* are set (routing ambiguity)")
-        hints.append("Prefer BINANCEUS_* only; unset BINANCE_* to avoid surprises")
-
     # 4) Venue allowlist sanity
     allowed = _env("ROUTER_ALLOWED", "").upper()
     if allowed:
