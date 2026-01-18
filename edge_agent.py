@@ -60,6 +60,20 @@ logging.basicConfig(
 )
 log = logging.getLogger("edge")
 
+# --- Phase29: Config Doctor boot-line (warn-only) ---
+try:
+    from config_doctor import run_edge_config_doctor
+    summary = run_edge_config_doctor()
+    # summary should be a dict like {"status":"PASS|WARN", "warnings":[...]}
+    status = summary.get("status", "PASS")
+    warns = summary.get("warnings", []) or []
+    if warns:
+        print(f"[EDGE_CONFIG] {status} warn_count={len(warns)} top={warns[0]}")
+    else:
+        print(f"[EDGE_CONFIG] {status}")
+except Exception as e:
+    print(f"[EDGE_CONFIG] WARN failed_to_run_doctor err={type(e).__name__}:{e}")
+
 
 # ---------- HMAC + HTTP helpers ----------
 
