@@ -21,6 +21,10 @@ from typing import Any, Dict, List, Optional
 import importlib
 import requests
 
+# Phase 29 safety
+from config_doctor import emit_once as _config_emit_once
+from safety_doctrine import live_gate
+
 # Phase 24B idempotency ledger (kept; not stripped)
 from edge_idempotency import claim as _idem_claim, mark_done as _idem_done
 
@@ -619,8 +623,10 @@ def execute_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
 
     if EDGE_HOLD:
         return _simulate_receipt(intent, reason="EDGE_HOLD")
-    if EDGE_MODE != "live" or mode != "live":
-        return _simulate_receipt(intent, reason=f"mode={EDGE_MODE}, intent_mode={mode}")
+
+    gate = live_gate(intent_mode=mode)
+    if not gate.allowed:
+        return _simulate_receipt(intent, reason=gate.reason)
 
     exec_fn = import_exec_for_venue(venue)
     raw_res = exec_fn(intent)
@@ -640,6 +646,11 @@ def execute_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def main() -> None:
+    # One-line config health at startup (warnings only)
+    try:
+        _config_emit_once(prefix="EDGE_CONFIG")
+    except Exception:
+        pass
     log.info("online — mode=%s hold=%s base=%s agent=%s", EDGE_MODE, EDGE_HOLD, BASE_URL, AGENT_ID)
 
     # Start telemetry pusher thread (non-fatal if it fails)
