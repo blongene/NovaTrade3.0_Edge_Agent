@@ -64,17 +64,34 @@ log = logging.getLogger("edge")
 
 # --- Phase29: Config Doctor boot-line (warn-only) ---
 try:
-    from config_doctor import run_edge_config_doctor
-    summary = run_edge_config_doctor()
-    # summary should be a dict like {"status":"PASS|WARN", "warnings":[...]}
-    status = summary.get("status", "PASS")
-    warns = summary.get("warnings", []) or []
-    if warns:
-        print(f"[EDGE_CONFIG] {status} warn_count={len(warns)} top={warns[0]}")
+    import config_doctor
+
+    # Pick whichever function exists in this module (compatible across versions)
+    fn = None
+    for name in ("run_edge_config_doctor", "run_doctor", "run", "doctor", "check", "check_edge_env", "edge_doctor"):
+        if hasattr(config_doctor, name):
+            fn = getattr(config_doctor, name)
+            break
+
+    if fn is None:
+        print("[EDGE_CONFIG] WARN config_doctor_missing_entrypoint", flush=True)
     else:
-        print(f"[EDGE_CONFIG] {status}")
+        summary = fn()
+        # normalize output
+        if isinstance(summary, dict):
+            status = summary.get("status", "PASS")
+            warns = summary.get("warnings", []) or []
+            if warns:
+                print(f"[EDGE_CONFIG] {status} warn_count={len(warns)} top={warns[0]}", flush=True)
+            else:
+                print(f"[EDGE_CONFIG] {status}", flush=True)
+        else:
+            # assume string
+            s = str(summary)
+            print(s if s.startswith("[EDGE_CONFIG]") else f"[EDGE_CONFIG] {s}", flush=True)
+
 except Exception as e:
-    print(f"[EDGE_CONFIG] WARN failed_to_run_doctor err={type(e).__name__}:{e}")
+    print(f"[EDGE_CONFIG] WARN failed_to_run_doctor err={type(e).__name__}:{e}", flush=True)
 
 
 # ---------- HMAC + HTTP helpers ----------
