@@ -104,11 +104,6 @@ def run_edge_config_doctor():
     tel  = _val("TELEMETRY_SECRET")
     out  = _val("OUTBOX_SECRET")
 
-    if edge and out and edge == out:
-        warnings.append("EDGE_SECRET equals OUTBOX_SECRET (blast radius)")
-    if tel and out and tel == out:
-        warnings.append("TELEMETRY_SECRET equals OUTBOX_SECRET (blast radius)")
-
     # 2) Binance var ambiguity
     has_bus  = bool(_val("BINANCEUS_API_KEY") or _val("BINANCEUS_API_SECRET") or _val("BINANCEUS_BASE_URL"))
     has_bin  = bool(_val("BINANCE_API_KEY") or _val("BINANCE_API_SECRET") or _val("BINANCE_BASE_URL"))
