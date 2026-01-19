@@ -31,6 +31,12 @@ from edge_idempotency import claim as _idem_claim, mark_done as _idem_done
 from telemetry_sender import start_balance_pusher  # existing helper
 from telemetry_sender import _collect_balances
 
+import time
+
+EDGE_HEALTH_INTERVAL_S = int(os.getenv("EDGE_HEALTH_INTERVAL_S", "3600"))
+
+_last_health_log_ts = 0
+_last_pull_ok_ts = None
 
 # ---------- Config ----------
 
@@ -245,6 +251,7 @@ def bus_ack(cmd_id: int, ok: bool, receipt: Dict[str, Any], *, status: Optional[
     }
     return _post_json("/api/commands/ack", body)
 
+_last_pull_ok_ts = time.time()
 
 # ---------- Venue resolver ----------
 
@@ -677,7 +684,19 @@ def main() -> None:
         _config_emit_once(prefix="EDGE_CONFIG")
     except Exception:
         pass
+
     log.info("online — mode=%s hold=%s base=%s agent=%s", EDGE_MODE, EDGE_HOLD, BASE_URL, AGENT_ID)
+
+    # --- Phase 29: low-frequency health heartbeat (default: 60 minutes) ---
+    # Controls: EDGE_HEALTH_INTERVAL_S=3600 (set 0 to disable)
+    try:
+        EDGE_HEALTH_INTERVAL_S = int(os.getenv("EDGE_HEALTH_INTERVAL_S", "3600"))
+    except Exception:
+        EDGE_HEALTH_INTERVAL_S = 3600
+
+    last_health_log_ts = 0.0
+    last_pull_ok_ts = 0.0  # updated whenever we successfully reach the Bus/poller loop
+    # --- end ---
 
     # Start telemetry pusher thread (non-fatal if it fails)
     try:
@@ -686,7 +705,33 @@ def main() -> None:
         log.error("failed to start balance pusher: %s", e)
 
     while True:
-        intents = _poll_commands()
+        # If _poll_commands() returns normally (even empty), consider Bus pull "ok"
+        try:
+            intents = _poll_commands()
+            last_pull_ok_ts = time.time()
+        except Exception:
+            # _poll_commands() should already log, but don't kill the loop
+            intents = []
+            # do NOT update last_pull_ok_ts here
+
+        # Emit one calm heartbeat per interval (no spam)
+        if EDGE_HEALTH_INTERVAL_S > 0:
+            now = time.time()
+            if (now - last_health_log_ts) >= EDGE_HEALTH_INTERVAL_S:
+                age = int(now - last_pull_ok_ts) if last_pull_ok_ts else -1
+                if age >= 0:
+                    log.info(
+                        "edge_health ok agent=%s poller=running last_pull_ok=%ss ago",
+                        AGENT_ID,
+                        age,
+                    )
+                else:
+                    log.info(
+                        "edge_health warn agent=%s poller=running last_pull_ok=never",
+                        AGENT_ID,
+                    )
+                last_health_log_ts = now
+
         if not intents:
             time.sleep(POLL_SECS)
             continue
